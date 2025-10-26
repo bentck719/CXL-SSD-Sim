@@ -30,11 +30,11 @@
 #ifndef __BASE_CPRINTF_HH__
 #define __BASE_CPRINTF_HH__
 
+#include <cstdint>
 #include <ios>
 #include <iostream>
 #include <list>
 #include <string>
-
 #include "base/cprintf_formats.hh"
 
 namespace gem5
