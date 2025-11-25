@@ -8,6 +8,7 @@
 #include "dev/pci/device.hh"
 #include "dev/storage/simplessd/hil/hil.hh"
 #include "dev/storage/simplessd/util/simplessd.hh"
+#include "dev/storage/fifo_queue.hh"
 #include "mem/packet.hh"
 #include "mem/packet_access.hh"
 #include "params/CxlMemory.hh"
@@ -20,17 +21,155 @@
 
 namespace gem5 {
 
-// #define CXL_SSD_PAGE_LEFT_BITS (12)                       // 12 bit //那这里没进行粒度转换吗？
-#define CXL_SSD_PAGE_LEFT_BITS (10)                       // 10 bit
-#define CXL_SSD_CAPACITY (1LL << 32)                      // 4G capacity
-#define CXL_SSD_CACHE_CAPACITY (1LL << 24)                // 32M capacity
-#define CXL_SSD_PAGE_SIZE (1LL << CXL_SSD_PAGE_LEFT_BITS) // 4K capacity
-#define CXL_SSD_CACHE_HIT_STAT (1 << 16)                  // 10 0000 counts
-// #define CXL_MEMORY_ENABLE 1
-// #define CXL_SSD_NO_CACHE 1
+// --- 1. Constants Correction ---
+#define CXL_SSD_CAPACITY        (1LL << 32) // 4GB Total File Size (Example)
+#define CXL_SSD_CACHE_CAPACITY  (1LL << 31) // 2GB Device DRAM
+#define CXL_SSD_PAGE_SIZE       (4096)      // 4KB Page Size
+#define CXL_MEM_CHUNK_SIZE      (256)       // 256B Chunk Size
+#define CXL_MEM_CHUNKS_PER_PAGE (16)        // 16 Chunks per Page
+
+// --- Memory Layout Boundaries (2GB Total) ---
+// Classify Area: 1GB (Holds 4KB Pages) -> 262,144 Pages
+// Store Area: 512MB (Holds 256B Chunks) -> 2,097,152 Chunks
+// Dirty Area: 512MB (Holds 256B Chunks) -> 2,097,152 Chunks
+#define NUM_CLASSIFY_PAGES (262144)
+#define NUM_STORE_CHUNKS   (2097152)
+#define NUM_DIRTY_CHUNKS   (2097152)
+
+// Thresholds for Anomaly Detection 
+#define THRESHOLD_ISOLATED     (4) // Access count > 4 -> Hotspot
+#define THRESHOLD_DISTRIBUTED  (4) // Unique chunks > 4 -> Block-like
 
 typedef uint64_t Tick;
-typedef size_t frame_id;
+typedef uint64_t logical_frame_t; // Page Address (LPN)
+typedef uint64_t logical_chunk_t; // Chunk Address (LPN * 16 + offset)
+typedef uint32_t chunk_index_t;   // 0-15
+typedef uint64_t phys_index_t;    // Index in the mmap array
+
+// Enum for Access Result
+enum class AccessStatus {
+    MISS,
+    HIT,
+    ANOMALY_MIGRATE // Signal to move to Host
+};
+
+// --- 2. Data Structures ---
+
+// Node for Classify Area (Page granularity)
+struct ClassifyNode {
+    logical_frame_t logical_frame; // Key
+    phys_index_t phys_index;       // Where in the 1GB buffer it lives
+    uint16_t chunk_bitmap;         // 16 bits [cite: 334]
+    uint8_t access_counts[CXL_MEM_CHUNKS_PER_PAGE]; // [cite: 335]
+
+    ClassifyNode(logical_frame_t lpn, phys_index_t p_idx)
+        : logical_frame(lpn), phys_index(p_idx), chunk_bitmap(0) {
+        std::memset(access_counts, 0, sizeof(access_counts));
+    }
+
+    void AccessChunk(chunk_index_t idx) {
+        chunk_bitmap |= (1 << idx);
+        if (access_counts[idx] < 255) access_counts[idx]++;
+    }
+};
+
+// Node for Store/Dirty Area (Chunk granularity)
+struct ChunkNode {
+    logical_chunk_t logical_chunk_addr; // Key
+    phys_index_t phys_index;            // Where in the buffer it lives
+    uint8_t access_count;               // 為了 Isolated Hotspot
+
+    ChunkNode(logical_chunk_t addr, phys_index_t p_idx) 
+        : logical_chunk_addr(addr), phys_index(p_idx), access_count(0) {}
+};
+
+// --- 3. Bi-Tiered Cache Controller ---
+class BiTieredCache {
+private:
+    // Physical Memory Management (Indices)
+    std::queue<phys_index_t> free_classify_indices;
+    std::queue<phys_index_t> free_store_indices;
+    std::queue<phys_index_t> free_dirty_indices;
+
+    // Logical Queues
+    FIFOQueue<logical_frame_t, ClassifyNode> *classify_queue;
+    FIFOQueue<logical_chunk_t, ChunkNode> *store_queue;
+    FIFOQueue<logical_chunk_t, ChunkNode> *dirty_queue;
+
+    // Callback to flush data to SSD
+    std::function<void(Addr, uint8_t*)> flush_callback;
+
+    // Helpers
+    phys_index_t AllocateClassifyIndex();
+    phys_index_t AllocateStoreIndex();
+    phys_index_t AllocateDirtyIndex();
+
+    void FreeClassifyIndex(phys_index_t idx) { free_classify_indices.push(idx); }
+    void FreeStoreIndex(phys_index_t idx) { free_store_indices.push(idx); }
+    void FreeDirtyIndex(phys_index_t idx) { free_dirty_indices.push(idx); }
+
+    // Internal Logic
+    void MoveToStore(const ClassifyNode& node, char* base_ptr);
+    void MoveToDirty(logical_chunk_t chunk_addr, const std::vector<uint8_t>& data, char* base_ptr);
+
+public:
+    BiTieredCache(std::function<void(Addr, uint8_t*)> flush_cb);
+    ~BiTieredCache();
+
+    AccessStatus HandleRead(Addr addr, uint32_t size, char* base_ptr);
+    AccessStatus HandleWrite(Addr addr, uint32_t size, const uint8_t* data, char* base_ptr);
+    void InsertToClassify(Addr addr, const std::vector<uint8_t>& page_data, char* base_ptr);
+
+    uint64_t GetPhysicalOffset(phys_index_t idx, int area_type); 
+};
+
+class CxlMemory : public PciDevice {
+private:
+  AddrRange range_;
+  Tick latency_;
+  Tick cxl_mem_latency_;
+
+  SimpleSSD::HIL::HIL *pHIL{nullptr};
+
+  int data_fd_{-1};
+  char *mapped_cache_{nullptr}; // Base pointer to 2GB mmap
+
+  // The Logic Module
+  BiTieredCache *haipc{nullptr}; 
+
+  // Page logically moved to Host DRAM 
+  std::set<logical_frame_t> migrated_pages_;
+
+  // 定義 Host DRAM 的延遲 (比 CXL 快)
+  // 論文數據: DDR5 4KB latency ~106ns
+  Tick host_dram_latency_{106500}; // 假設 106.5 ns (以 gem5 tick 為單位，假設 1 tick = 1 ps)
+  
+  // 定義遷移成本 (Migration Penalty)
+  // 讀取 4KB 並寫入 Host 的時間。假設頻寬 32GB/s -> 4KB 約需 125ns，加上協定開銷，設個保守值
+  Tick migration_penalty_{500000}; // 500 ns
+
+  uint64_t instruction_id{0};
+
+  Addr physicalAddrToSSDAddr(Addr addr) { return addr - range_.start(); };
+  uint8_t *toHostAddr(Addr addr);
+
+public:
+  virtual Tick read(PacketPtr pkt) override;
+  virtual Tick write(PacketPtr pkt) override;
+  virtual AddrRangeList getAddrRanges() const override;
+
+  void access(PacketPtr pkt);
+  Tick resolve_cxl_mem(PacketPtr ptk);
+  Tick ssdRead(PacketPtr pkt);
+  Tick ssdWrite(PacketPtr pkt);
+
+  // Called by HAIPC to flush chunks
+  void internalFlush(Addr ssd_addr, uint8_t* data);
+
+  using Param = CxlMemoryParams;
+  CxlMemory(const Param &p);
+  ~CxlMemory();
+};
 
 /**
  * eventengine override the simulator of simplessd
@@ -62,384 +201,7 @@ public:
   void deallocateEvent(SimpleSSD::Event) override;
 };
 
-struct Page {
-  uint64_t tag_;
-  uint8_t flag_;
-
-  static const uint64_t valid_offset = 0x0;
-  static const uint64_t dirty_offset = 0x1;
-
-  bool IsValid() { return gem5::bits(flag_, valid_offset); }
-  bool IsDirty() { return gem5::bits(flag_, dirty_offset); }
-
-  void SetValid() { gem5::set_bit(flag_, valid_offset); }
-  void SetDirty() { gem5::set_bit(flag_, dirty_offset); }
-
-  void ClearValid() { gem5::clear_bit(flag_, valid_offset); }
-  void ClearDirty() { gem5::clear_bit(flag_, dirty_offset); }
-
-  void SetTag(uint64_t tag) { tag_ = tag & (~(CXL_SSD_PAGE_SIZE - 1)); }
-
-  bool CacheHit(Addr addr) {
-    return ((addr >> CXL_SSD_PAGE_LEFT_BITS) ==
-            (tag_ >> CXL_SSD_PAGE_LEFT_BITS));
-  }
-};
-
 extern Engine engine;
 extern SimpleSSD::ConfigReader ssdConfig;
-
-enum class EvictStrategyMode { Direct, LRU, FIFO, TwoQ, LFRU };
-
-class LRUCache {
-  struct Node {
-    // frame means aligned to 4k
-    uint64_t logical_frame;
-    uint64_t frame_id;
-  };
-
-public:
-  std::unordered_map<int, std::list<Node>::iterator> mem_;
-  std::list<Node> table_;
-  size_t capacity_;
-
-  uint64_t allocated_id{0};
-  uint64_t total_pages{0};
-
-  // 4k multiples
-  LRUCache(size_t capacity) : capacity_(capacity) {
-    total_pages = capacity_ / CXL_SSD_PAGE_SIZE;
-  }
-
-  uint64_t access(uint64_t key) {
-    if (auto it = mem_.find(key); it != mem_.end()) {
-      auto frame_id = it->second->frame_id;
-      table_.splice(table_.end(), table_, it->second);
-      return frame_id;
-    }
-    if (table_.size() < total_pages) {
-      uint64_t value = allocated_id++;
-      table_.push_back({key, value});
-      mem_.insert({key, --table_.end()});
-      return value;
-    }
-    auto [delete_logical, frame_id] = table_.front();
-    mem_.erase(delete_logical);
-    table_.erase(table_.begin());
-    table_.push_back({key, frame_id});
-    mem_.insert({key, --table_.end()});
-    return frame_id;
-  }
-};
-
-class FIFOCache {
-public:
-  struct Node {
-    // frame means aligned to 4k
-    uint64_t logical_frame;
-    uint64_t frame_id;
-  };
-
-public:
-  std::unordered_map<uint64_t, std::list<Node>::iterator> mem_;
-  std::list<Node> table_;
-  size_t capacity_;
-
-  uint64_t allocated_id{0};
-  uint64_t total_pages{0};
-
-  // 4k multiples
-  FIFOCache(size_t capacity) : capacity_(capacity) {
-    total_pages = capacity_ / CXL_SSD_PAGE_SIZE;
-  }
-
-  bool Exist(uint64_t key) { return mem_.find(key) != mem_.end(); }
-  // FIFO strategy
-  uint64_t access(uint64_t key) {
-    if (auto it = mem_.find(key); it != mem_.end()) {
-      return it->second->frame_id;
-    }
-    if (table_.size() < total_pages) {
-      uint64_t value = allocated_id++;
-      table_.push_back({key, value});
-      mem_.insert({key, --table_.end()});
-      return value;
-    }
-    auto [delete_logical, frame_id] = table_.front();
-    mem_.erase(delete_logical);
-    table_.erase(table_.begin());
-    table_.push_back({key, frame_id});
-    mem_.insert({key, --table_.end()});
-    return frame_id;
-  }
-};
-
-class LFRUCache {
-private:
-  struct LFRUNode {
-    int cnt;  // frequency for lfu
-    int time; // for lru
-    uint64_t key;
-    uint64_t value;
-    LFRUNode(int _cnt, int _time, int _key, int _value)
-        : cnt(_cnt), time(_time), key(_key), value(_value) {}
-
-    bool operator<(const LFRUNode item) const {
-      return cnt == item.cnt ? time < item.time : cnt < item.cnt;
-    }
-  };
-
-  uint64_t capacity;
-  uint64_t time_;
-  std::unordered_map<uint64_t, std::set<LFRUNode>::iterator> map_;
-  std::set<LFRUNode> mem_;
-
-  uint64_t total_pages_;
-  uint64_t allocated_id_{0};
-
-public:
-  LFRUCache(int _capacity) : capacity(_capacity), time_(0) {
-    total_pages_ = capacity / CXL_SSD_PAGE_SIZE;
-  }
-
-  uint64_t access(uint64_t key) {
-    if (auto it = map_.find(key); it != map_.end()) {
-      auto iterator = it->second;
-      auto node = mem_.extract(iterator);
-      assert(bool(node));
-      node.value().cnt += 1;
-      node.value().time = ++time_;
-      auto res_value = node.value().value;
-      mem_.insert(std::move(node));
-      return res_value;
-    }
-    if (mem_.size() < total_pages_) {
-      uint64_t value = allocated_id_++;
-      auto insert_pair = mem_.insert(LFRUNode(1, ++time_, key, value));
-      assert(insert_pair.second);
-      map_.insert({key, insert_pair.first});
-      return value;
-    }
-    assert(mem_.size() == total_pages_);
-    auto delete_node = mem_.extract(mem_.begin());
-    assert(bool(delete_node));
-    map_.erase(delete_node.value().key);
-    auto value = delete_node.value().value;
-    delete_node.value().cnt = 1;
-    delete_node.value().time = ++time_;
-    delete_node.value().key = key;
-    auto insert_pair = mem_.insert(std::move(delete_node));
-    assert(insert_pair.inserted);
-    map_.insert({key, insert_pair.position});
-    return value;
-  }
-};
-
-class EvictStrategy {
-public:
-  virtual uint64_t access(uint64_t logical_frame) = 0;
-  virtual ~EvictStrategy() = default;
-};
-
-class DirectEvictStrategy : public EvictStrategy {
-public:
-  uint64_t page_counts;
-  DirectEvictStrategy(uint64_t page_counts) : page_counts(page_counts) {}
-  uint64_t access(uint64_t logical_frame) override {
-    uint64_t tag = logical_frame / CXL_SSD_PAGE_SIZE;
-    uint64_t index = tag & (page_counts - 1);
-    return index;
-  }
-};
-
-class LRUEvictStrategy : public EvictStrategy {
-public:
-  LRUCache cache;
-  LRUEvictStrategy(uint64_t capacity) : cache(capacity) {}
-  uint64_t access(uint64_t logical_frame) override {
-    return cache.access(logical_frame);
-  }
-};
-class FIFOEvictStrategy : public EvictStrategy {
-public:
-  FIFOCache cache;
-  FIFOEvictStrategy(uint64_t capacity) : cache(capacity) {}
-  uint64_t access(uint64_t logical_frame) override {
-    return cache.access(logical_frame);
-  }
-};
-
-class LFRUEviceStrategy : public EvictStrategy {
-public:
-  LFRUCache cache;
-  LFRUEviceStrategy(uint64_t capacity) : cache(capacity) {}
-  uint64_t access(uint64_t logical_frame) override {
-    return cache.access(logical_frame);
-  }
-};
-
-class TwoQEvictStrategy : public EvictStrategy {
-public:
-  struct Node {
-    // frame means aligned to 4k
-    uint64_t logical_frame;
-    uint64_t frame_id;
-  };
-
-public:
-  std::unordered_map<uint64_t, std::list<Node>::iterator> fifo_map_;
-  std::list<Node> fifo_list_;
-
-  std::unordered_map<uint64_t, std::list<Node>::iterator> lru_map_;
-  std::list<Node> lru_list_;
-
-  size_t capacity_;
-  size_t queue_pages_;
-
-  uint64_t allocated_id_{0};
-  uint64_t total_pages_{0};
-
-  std::list<uint64_t> free_frame_id_;
-
-  explicit TwoQEvictStrategy(size_t capacity) : capacity_(capacity) {
-    total_pages_ = capacity_ / CXL_SSD_PAGE_SIZE;
-    queue_pages_ = total_pages_ / 2;
-  }
-
-  uint64_t fifoQueueAccess(uint64_t key) {
-    if (auto it = fifo_map_.find(key); it != fifo_map_.end()) {
-      return it->second->frame_id;
-    }
-
-    if (fifo_list_.size() == queue_pages_) {
-      auto [delete_logical, frame_id] = fifo_list_.front();
-      fifo_map_.erase(delete_logical);
-      fifo_list_.erase(fifo_list_.begin());
-      fifo_list_.push_back({key, frame_id});
-      fifo_map_.insert({key, --fifo_list_.end()});
-      return frame_id;
-    }
-    assert(fifo_list_.size() < queue_pages_);
-    uint64_t value = -1;
-    if (!free_frame_id_.empty()) {
-      value = free_frame_id_.back();
-      free_frame_id_.pop_back();
-    } else {
-      value = allocated_id_++;
-    }
-    fifo_list_.push_back({key, value});
-    fifo_map_.insert({key, --fifo_list_.end()});
-    return value;
-  }
-
-  uint64_t lruQueueAccess(uint64_t key) {
-    if (auto it = lru_map_.find(key); it != lru_map_.end()) {
-      auto frame_id = it->second->frame_id;
-      lru_list_.splice(lru_list_.end(), lru_list_, it->second);
-      return frame_id;
-    }
-    if (lru_list_.size() == queue_pages_) {
-      auto [delete_logical, frame_id] = lru_list_.front();
-      lru_map_.erase(delete_logical);
-      lru_list_.erase(lru_list_.begin());
-      if (!free_frame_id_.empty()) {
-        auto last_frame_id = free_frame_id_.back();
-        free_frame_id_.pop_back();
-        free_frame_id_.push_back(frame_id);
-        lru_list_.push_back({key, last_frame_id});
-        lru_map_.insert({key, --lru_list_.end()});
-        return last_frame_id;
-      } else {
-        lru_list_.push_back({key, frame_id});
-        lru_map_.insert({key, --lru_list_.end()});
-        return frame_id;
-      }
-    }
-    assert(lru_list_.size() < queue_pages_);
-    uint64_t value = -1;
-    if (!free_frame_id_.empty()) {
-      value = free_frame_id_.back();
-      free_frame_id_.pop_back();
-    } else {
-      value = allocated_id_++;
-    }
-    lru_list_.push_back({key, value});
-    lru_map_.insert({key, --lru_list_.end()});
-    return value;
-  }
-
-  bool fifoExist(uint64_t key) {
-    return fifo_map_.find(key) != fifo_map_.end();
-  }
-
-  bool lruExist(uint64_t key) { return lru_map_.find(key) != lru_map_.end(); }
-
-  uint64_t access(uint64_t logical_frame) override {
-    if (lruExist(logical_frame)) {
-      return lruQueueAccess(logical_frame);
-    }
-    if (auto it = fifo_map_.find(logical_frame); it != fifo_map_.end()) {
-      auto [delete_logical, frame_id] = *it->second;
-      assert(logical_frame == delete_logical);
-      fifo_map_.erase(delete_logical);
-      fifo_list_.erase(it->second);
-      free_frame_id_.push_back(frame_id);
-      return lruQueueAccess(logical_frame);
-    }
-    return fifoQueueAccess(logical_frame);
-  }
-};
-
-EvictStrategy *Worker(EvictStrategyMode mode, uint64_t capacity);
-
-class CxlMemory : public PciDevice {
-private:
-  AddrRange range_{0, 1 << 30}; // cpu allocate addr range for cxlssd device
-  //  Memory mem_;
-  Tick latency_;
-  Tick cxl_mem_latency_;
-
-  SimpleSSD::HIL::HIL *pHIL{nullptr};
-
-  // CXL_SSD_CAPACITY mapped region
-  int data_fd_{-1};
-  uint64_t cache_hit_counts_{0};
-  uint64_t access_counts_{0};
-  char *mapped_cache_{nullptr};
-
-  uint64_t instruction_id{0};
-  uint32_t logical_page_size_{CXL_SSD_PAGE_SIZE};
-  // uint32_t logical_page_size_{1 << 10};
-
-  uint64_t capacity{CXL_SSD_CAPACITY};
-  uint64_t cache_capacity{CXL_SSD_CACHE_CAPACITY};
-
-  uint64_t pages_counts{CXL_SSD_CACHE_CAPACITY / CXL_SSD_PAGE_SIZE};
-
-  Addr physicalAddrToSSDAddr(Addr addr) { return addr - range_.start(); };
-
-  Page *pages{nullptr};
-  EvictStrategy *evict_strategy{nullptr};
-
-public:
-  virtual Tick read(PacketPtr pkt) override;
-  virtual Tick write(PacketPtr pkt) override;
-
-  void access(PacketPtr pkt);
-  virtual AddrRangeList getAddrRanges() const override;
-
-  Tick resolve_cxl_mem(PacketPtr ptk);
-
-  // for cxl-ssd
-  uint8_t *toHostAddr(Addr addr);
-  bool ssdAddrCheck(PacketPtr &ptk);
-  Tick ssdRead(PacketPtr pkt);
-  Tick ssdWrite(PacketPtr pkt);
-  uint64_t GetPagesIndex(Addr ssd_start) const;
-
-  using Param = CxlMemoryParams;
-  CxlMemory(const Param &p);
-  ~CxlMemory();
-};
 
 } // namespace gem5

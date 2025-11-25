@@ -7,10 +7,9 @@
 namespace gem5 {
 
 /**
- * eventEngine global variable
+ * Global Variables & SimpleSSD Engine Setup
  */
 Engine engine;
-
 std::ostream *pDebugLog = nullptr;
 SimpleSSD::ConfigReader ssdConfig =
     initSimpleSSDEngine(&engine, pDebugLog, pDebugLog,
@@ -18,78 +17,53 @@ SimpleSSD::ConfigReader ssdConfig =
 /**
  * eventengine for simplessd
  */
-Engine::Engine()
-    : SimpleSSD::Simulator(), simTick(0), counter(0), eventHandled(0) {}
-
+Engine::Engine() : SimpleSSD::Simulator(), simTick(0), counter(0), eventHandled(0) {}
 Engine::~Engine() {}
 
-bool Engine::insertEvent(SimpleSSD::Event eid, uint64_t tick,
-                         uint64_t *pOldTick) {
+bool Engine::insertEvent(SimpleSSD::Event eid, uint64_t tick, uint64_t *pOldTick) {
   bool found = false;
-  bool flag = false;
-  auto old = eventQueue.begin();
   auto insert = eventQueue.end();
 
   for (auto iter = eventQueue.begin(); iter != eventQueue.end(); iter++) {
     if (iter->first == eid) {
       found = true;
-      old = iter;
-
-      if (pOldTick) {
-        *pOldTick = iter->second;
-      }
+      if (pOldTick) *pOldTick = iter->second;
+      eventQueue.erase(iter); // Remove old event
+      break; 
     }
+  }
 
-    if (iter->second > tick && !flag) {
+  // Re-find insertion point after erasure or if new
+  for (auto iter = eventQueue.begin(); iter != eventQueue.end(); iter++) {
+    if (iter->second > tick) {
       insert = iter;
       flag = true;
-    }
-  }
-
-  if (found && pOldTick) {
-    if (*pOldTick == tick) {
-      // Rescheduling to same tick. Ignore.
-      return false;
-    }
-  }
-
-  // Iterator will not invalidated on insert
-  // Do insert first
-  eventQueue.insert(insert, {eid, tick});
-
-  if (found) {
-    eventQueue.erase(old);
-  }
-
-  return found;
-}
-
-bool Engine::removeEvent(SimpleSSD::Event eid) {
-  bool found = false;
-
-  for (auto iter = eventQueue.begin(); iter != eventQueue.end(); iter++) {
-    if (iter->first == eid) {
-      eventQueue.erase(iter);
-      found = true;
-
       break;
     }
   }
 
+  // Insert event
+  eventQueue.insert(insert, {eid, tick});
   return found;
+}
+
+bool Engine::removeEvent(SimpleSSD::Event eid) {
+  for (auto iter = eventQueue.begin(); iter != eventQueue.end(); iter++) {
+    if (iter->first == eid) {
+      eventQueue.erase(iter);
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Engine::isEventExist(SimpleSSD::Event eid, uint64_t *pTick) {
   for (auto &iter : eventQueue) {
     if (iter.first == eid) {
-      if (pTick) {
-        *pTick = iter.second;
-      }
-
+      if (pTick) *pTick = iter.second;
       return true;
     }
   }
-
   return false;
 }
 
@@ -97,47 +71,22 @@ uint64_t Engine::getCurrentTick() { return simTick; }
 
 SimpleSSD::Event Engine::allocateEvent(SimpleSSD::EventFunction func) {
   auto iter = eventList.insert({++counter, func});
-
-  if (!iter.second) {
-    SimpleSSD::ssd_panic("Fail to allocate event");
-  }
-
+  if (!iter.second) SimpleSSD::ssd_panic("Fail to allocate event");
   return counter;
 }
 
 void Engine::scheduleEvent(SimpleSSD::Event eid, uint64_t tick) {
   auto iter = eventList.find(eid);
-
   if (iter != eventList.end()) {
-    uint64_t tickCopy;
-
-    tickCopy = simTick;
-
-    if (tick < tickCopy) {
-      SimpleSSD::ssd_warn("Tried to schedule %" PRIu64
-                          " < simTick to event %" PRIu64
-                          ". Set tick as simTick.",
-                          tick, eid);
-
-      tick = tickCopy;
-    }
-
-    uint64_t oldTick;
-
-    if (insertEvent(eid, tick, &oldTick)) {
-      SimpleSSD::ssd_warn("Event %" PRIu64 " rescheduled from %" PRIu64
-                          " to %" PRIu64,
-                          eid, oldTick, tick);
-    }
+    if (tick < simTick) tick = simTick;
+    insertEvent(eid, tick, nullptr);
   } else {
     SimpleSSD::ssd_panic("Event %" PRIu64 " does not exists", eid);
   }
 }
 
 void Engine::descheduleEvent(SimpleSSD::Event eid) {
-  auto iter = eventList.find(eid);
-
-  if (iter != eventList.end()) {
+  if (eventList.find(eid) != eventList.end()) {
     removeEvent(eid);
   } else {
     SimpleSSD::ssd_panic("Event %" PRIu64 " does not exists", eid);
@@ -145,21 +94,16 @@ void Engine::descheduleEvent(SimpleSSD::Event eid) {
 }
 
 bool Engine::isScheduled(SimpleSSD::Event eid, uint64_t *pTick) {
-  bool ret = false;
-  auto iter = eventList.find(eid);
-
-  if (iter != eventList.end()) {
-    ret = isEventExist(eid, pTick);
+  if (eventList.find(eid) != eventList.end()) {
+    return isEventExist(eid, pTick);
   } else {
     SimpleSSD::ssd_panic("Event %" PRIu64 " does not exists", eid);
   }
-
-  return ret;
+  return false;
 }
 
 void Engine::deallocateEvent(SimpleSSD::Event eid) {
   auto iter = eventList.find(eid);
-
   if (iter != eventList.end()) {
     removeEvent(eid);
     eventList.erase(iter);
@@ -168,28 +112,290 @@ void Engine::deallocateEvent(SimpleSSD::Event eid) {
   }
 }
 
-EvictStrategy *Worker(EvictStrategyMode mode, uint64_t capacity) {
-  if (mode == EvictStrategyMode::Direct) {
-    return new DirectEvictStrategy(capacity / CXL_SSD_PAGE_SIZE);
-  } else if (mode == EvictStrategyMode::LRU) {
-    return new LRUEvictStrategy(capacity);
-  } else if (mode == EvictStrategyMode::FIFO) {
-    return new FIFOEvictStrategy(capacity);
-  } else if (mode == EvictStrategyMode::TwoQ) {
-    return new TwoQEvictStrategy(capacity);
-  } else if (mode == EvictStrategyMode::LFRU) {
-    return new LFRUEviceStrategy(capacity);
-  }
-  assert(0);
+// ==========================================
+// BiTieredCache Implementation
+// ==========================================
+
+BiTieredCache::BiTieredCache(std::function<void(Addr, uint8_t*)> flush_cb) 
+    : flush_callback(flush_cb) {
+    
+    classify_queue = new FIFOQueue<logical_frame_t, ClassifyNode>(NUM_CLASSIFY_PAGES);
+    store_queue = new FIFOQueue<logical_chunk_t, ChunkNode>(NUM_STORE_CHUNKS);
+    dirty_queue = new FIFOQueue<logical_chunk_t, ChunkNode>(NUM_DIRTY_CHUNKS);
+
+    // Initialize Free Lists
+    for(phys_index_t i = 0; i < NUM_CLASSIFY_PAGES; ++i) free_classify_indices.push(i);
+    for(phys_index_t i = 0; i < NUM_STORE_CHUNKS; ++i) free_store_indices.push(i);
+    for(phys_index_t i = 0; i < NUM_DIRTY_CHUNKS; ++i) free_dirty_indices.push(i);
 }
 
-/**
- * CxlMemory
- */
+BiTieredCache::~BiTieredCache() {
+    delete classify_queue;
+    delete store_queue;
+    delete dirty_queue;
+}
+
+// Helper to calculate byte offset in the 2GB file
+uint64_t BiTieredCache::GetPhysicalOffset(phys_index_t idx, int area_type) {
+    uint64_t classify_size = (uint64_t)NUM_CLASSIFY_PAGES * CXL_SSD_PAGE_SIZE; // 1GB
+    uint64_t store_size = (uint64_t)NUM_STORE_CHUNKS * CXL_MEM_CHUNK_SIZE;      // 512MB
+    
+    if (area_type == 0) { // Classify
+        return idx * CXL_SSD_PAGE_SIZE;
+    } else if (area_type == 1) { // Store
+        return classify_size + (idx * CXL_MEM_CHUNK_SIZE);
+    } else { // Dirty
+        return classify_size + store_size + (idx * CXL_MEM_CHUNK_SIZE);
+    }
+}
+
+// Allocator Helpers
+phys_index_t BiTieredCache::AllocateClassifyIndex() {
+    if(free_classify_indices.empty()) return (phys_index_t)-1;
+    phys_index_t idx = free_classify_indices.front();
+    free_classify_indices.pop();
+    return idx;
+}
+phys_index_t BiTieredCache::AllocateStoreIndex() {
+    if(free_store_indices.empty()) return (phys_index_t)-1;
+    phys_index_t idx = free_store_indices.front();
+    free_store_indices.pop();
+    return idx;
+}
+phys_index_t BiTieredCache::AllocateDirtyIndex() {
+    if(free_dirty_indices.empty()) return (phys_index_t)-1;
+    phys_index_t idx = free_dirty_indices.front();
+    free_dirty_indices.pop();
+    return idx;
+}
+
+// Core Read Logic
+AccessStatus BiTieredCache::HandleRead(Addr addr, uint32_t size, char* base_ptr) {
+    // Note: We assume requests coming here are fine-grained (<= 256B) 
+    // or we break larger requests into chunks. 
+    // Here we strictly handle the address as a specific chunk lookup.
+    
+    logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
+    logical_chunk_t lcn = addr / CXL_MEM_CHUNK_SIZE;
+    chunk_index_t offset_in_page = (addr % CXL_SSD_PAGE_SIZE) / CXL_MEM_CHUNK_SIZE;
+
+    // 1. Check Dirty
+    if (dirty_queue->Contains(lcn)) {
+        DPRINTF(CxlMemory, "Read HIT in Dirty: LCN %lu\n", lcn);
+        return AccessStatus::HIT; 
+    }
+    // 2. Check Store
+    if (store_queue->Contains(lcn)) {
+      DPRINTF(CxlMemory, "Read HIT in Store: LCN %lu\n", lcn);
+
+      // 避免 uint8_t access_count 溢位
+      if (s_node->access_count < 255) s_node->access_count++;
+
+      // 檢查 Isolated Hotspot
+      if (s_node->access_count > THRESHOLD_ISOLATED) {
+        DPRINTF(CxlMemory, "Anomaly (Isolated) in Store: LCN %lu\n", lcn);
+        // 論文: "For such cases, the entire 4KB page must be reloaded..."
+        // 這裡回傳 MIGRATE 信號，CxlMemory 會模擬這個 reload + migrate 的延遲
+        return AccessStatus::ANOMALY_MIGRATE;
+      }
+
+      return AccessStatus::HIT;
+    }
+    // 3. Check Classify
+    ClassifyNode* node = classify_queue->Get(lpn);
+    if (node) {
+        DPRINTF(CxlMemory, "Read HIT in Classify: LPN %lu\n", lpn);
+        node->AccessChunk(offset_in_page);
+
+        // Anomaly Detection
+        if (node->access_counts[offset_in_page] > THRESHOLD_ISOLATED) return AccessStatus::ANOMALY_MIGRATE;
+        
+        int unique = 0;
+        for(int i=0; i < CXL_MEM_CHUNKS_PER_PAGE; ++i) if((node->chunk_bitmap >> i) & 1) unique++;
+        if (unique > THRESHOLD_DISTRIBUTED) return AccessStatus::ANOMALY_MIGRATE;
+
+        return AccessStatus::HIT;
+    }
+    return AccessStatus::MISS;
+}
+
+// Core Write Logic
+AccessStatus BiTieredCache::HandleWrite(Addr addr, uint32_t size, const uint8_t* data, char* base_ptr) {
+  logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
+  logical_chunk_t lcn = addr / CXL_MEM_CHUNK_SIZE;
+  chunk_index_t offset_in_page = (addr % CXL_SSD_PAGE_SIZE) / CXL_MEM_CHUNK_SIZE;
+
+  // 1. If in Classify -> Move to Dirty
+  ClassifyNode* c_node = classify_queue->Get(lpn);
+  if (c_node) { // Copy data from Classify Area (4KB) to temp buffer
+    //  Updates count towards Anomaly
+    c_node->AccessChunk(offset_in_page);
+
+    // Check Anomaly: Distributed Hotspot
+    // (寫入通常會增加 unique chunk count，容易觸發 Distributed)
+    int unique = 0;
+    for(int i=0; i < CXL_MEM_CHUNKS_PER_PAGE; ++i) {
+      if((c_node->chunk_bitmap >> i) & 1) unique++;
+    }
+
+    if (unique > THRESHOLD_DISTRIBUTED) {
+      DPRINTF(CxlMemory, "Anomaly (Distributed) on Write: LPN %lu. Migrating to Host.\n", lpn);
+      return AccessStatus::ANOMALY_MIGRATE;
+    }
+
+    // 若無 Anomaly，則執行 "Move to Dirty" 
+    uint64_t src_off = GetPhysicalOffset(c_node->phys_index, 0) + (offset_in_page * CXL_MEM_CHUNK_SIZE);
+    std::vector<uint8_t> buf(CXL_MEM_CHUNK_SIZE);
+    std::memcpy(buf.data(), base_ptr + src_off, CXL_MEM_CHUNK_SIZE); // Copy old data
+    if (size <= CXL_MEM_CHUNK_SIZE) std::memcpy(buf.data(), data, size); // Apply update
+
+    MoveToDirty(lcn, chunk_data, base_ptr);
+    return AccessStatus::HIT; // Hit & Handled
+  }
+
+  // 2. Store -> Move to Dirty
+  ChunkNode* s_node = store_queue->Get(lcn);
+  if (s_node) {
+    // 避免 uint8_t access_count 溢位
+    if (s_node->access_count < 255) s_node->access_count++;
+
+    if (s_node->access_count > THRESHOLD_ISOLATED) {
+      DPRINTF(CxlMemory, "Anomaly (Isolated) on Write in Store: LCN %lu\n", lcn);
+      return AccessStatus::ANOMALY_MIGRATE;
+    }
+
+    // 若無 Anomaly，才執行 Move to Dirty
+    uint64_t src_off = GetPhysicalOffset(s_node->phys_index, 1);
+    std::vector<uint8_t> buf(CXL_MEM_CHUNK_SIZE);
+    std::memcpy(buf.data(), base_ptr + src_off, CXL_MEM_CHUNK_SIZE);
+    if (size <= CXL_MEM_CHUNK_SIZE) std::memcpy(buf.data(), data, size);
+
+    // Remove from Store & Free Index
+    phys_index_t s_idx = s_node->phys_index;
+    store_queue->Remove(lcn);
+    FreeStoreIndex(s_idx);
+
+    MoveToDirty(lcn, buf, base_ptr);
+    return AccessStatus::HIT;
+  }
+
+  // 3. Dirty -> Update
+  ChunkNode* d_node = dirty_queue->Get(lcn);
+  if (d_node) {
+      uint64_t offset = GetPhysicalOffset(d_node->phys_index, 2);
+      std::memcpy(base_ptr + offset, data, size);
+      return AccessStatus::HIT;
+  }
+
+  // 4. Miss
+  return AccessStatus::MISS;
+}
+
+// Called on Read Miss: Insert fetched page into Classify, Strict FIFO Eviction Logic
+void BiTieredCache::InsertToClassify(Addr addr, const std::vector<uint8_t>& page_data, char* base_ptr) {
+  logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
+  phys_index_t p_idx;
+  
+  if (classify_queue->IsFull()) {
+      // Evict Oldest (Victim)
+      ClassifyNode& victim_ref = classify_queue->PeekFront(); // Peek before remove
+      
+      // Move valid chunks to Store
+      MoveToStore(victim_ref, base_ptr);
+      
+      // Reuse the physical index
+      p_idx = victim_ref.phys_index;
+      
+      // Now actually remove from logical queue
+      classify_queue->Remove(victim_ref.logical_frame);
+  } else {
+      p_idx = AllocateClassifyIndex();
+      if (p_idx == (phys_index_t)-1) return; // Should be covered by IsFull check
+  }
+  
+  // Write Data
+  uint64_t offset = GetPhysicalOffset(p_idx, 0);
+  std::memcpy(base_ptr + offset, page_data.data(), CXL_SSD_PAGE_SIZE);
+
+  // Insert
+  ClassifyNode new_node(lpn, p_idx);
+  classify_queue->Insert(lpn, new_node);
+}
+
+void BiTieredCache::MoveToStore(const ClassifyNode& node, char* base_ptr) {
+    for (int i = 0; i < CXL_MEM_CHUNKS_PER_PAGE; ++i) {
+        if (node.chunk_bitmap & (1 << i)) {
+            logical_chunk_t lcn = (node.logical_frame * CXL_MEM_CHUNKS_PER_PAGE) + i;
+            phys_index_t s_idx;
+
+            // Check if already in Store to avoid duplicates (though unlikely with this logic flow)
+            if (store_queue->Contains(lcn)) continue;
+
+            if (store_queue->IsFull()) {
+                // Evict from Store (FIFO)
+                ChunkNode& victim = store_queue->PeekFront();
+                s_idx = victim.phys_index; // Reuse index
+                store_queue->Remove(victim.logical_chunk_addr);
+            } else {
+                s_idx = AllocateStoreIndex();
+            }
+
+            // Copy Data
+            uint64_t src = GetPhysicalOffset(node.phys_index, 0) + (i * CXL_MEM_CHUNK_SIZE);
+            uint64_t dst = GetPhysicalOffset(s_idx, 1);
+            std::memcpy(base_ptr + dst, base_ptr + src, CXL_MEM_CHUNK_SIZE);
+
+            store_queue->Insert(lcn, ChunkNode(lcn, s_idx));
+        }
+    }
+}
+
+void BiTieredCache::MoveToDirty(logical_chunk_t lcn, const std::vector<uint8_t>& data, char* base_ptr) {
+   phys_index_t d_idx;
+    
+    // Check if already exists (update only)
+    ChunkNode* existing = dirty_queue->Get(lcn);
+    if (existing) {
+        uint64_t offset = GetPhysicalOffset(existing->phys_index, 2);
+        std::memcpy(base_ptr + offset, data.data(), CXL_MEM_CHUNK_SIZE);
+        return;
+    }
+
+    if (dirty_queue->IsFull()) {
+        // Evict from Dirty (FIFO) -> Flush
+        ChunkNode& victim = dirty_queue->PeekFront();
+        
+        // Read data
+        uint64_t v_off = GetPhysicalOffset(victim.phys_index, 2);
+        std::vector<uint8_t> v_data(CXL_MEM_CHUNK_SIZE);
+        std::memcpy(v_data.data(), base_ptr + v_off, CXL_MEM_CHUNK_SIZE);
+
+        // Flush callback to SSD
+        flush_callback(victim.logical_chunk_addr * CXL_MEM_CHUNK_SIZE, v_data.data());
+        
+        d_idx = victim.phys_index; // Reuse index
+        dirty_queue->Remove(victim.logical_chunk_addr);
+    } else {
+        d_idx = AllocateDirtyIndex();
+    }
+
+    // Write new data
+    uint64_t offset = GetPhysicalOffset(d_idx, 2);
+    std::memcpy(base_ptr + offset, data.data(), CXL_MEM_CHUNK_SIZE);
+
+    dirty_queue->Insert(lcn, ChunkNode(lcn, d_idx));
+}
+
+
+
+// ==========================================
+// CxlMemory Implementation
+// ==========================================
 
 CxlMemory::CxlMemory(const Param &p)
     : PciDevice(p), latency_(p.latency), cxl_mem_latency_(p.cxl_mem_latency),
       pHIL(new SimpleSSD::HIL::HIL(ssdConfig)) {
+
   data_fd_ = open("./CxlSSD.img", O_RDWR | O_CREAT | O_TRUNC, 0666);
   if (data_fd_ == -1) {
     perror("Error opening file");
@@ -200,345 +406,187 @@ CxlMemory::CxlMemory(const Param &p)
     assert(0);
   }
 
-  mapped_cache_ = (char *)mmap(NULL, CXL_SSD_CAPACITY, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, data_fd_, 0);
-
+  mapped_cache_ = (char *)mmap(NULL, CXL_SSD_CAPACITY, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd_, 0);
   if (mapped_cache_ == MAP_FAILED) {
-    perror("Error mmap CxlSSD.img");
-    assert(0);
+    perror("Error mmap");
+    exit(1);
   }
-  pages = new Page[pages_counts];
-  evict_strategy = Worker(EvictStrategyMode::FIFO, cache_capacity);
+
+  // Init Cache with Callback to this->internalFlush
+  haipc = new BiTieredCache([this](Addr addr, uint8_t* data) {
+      this->internalFlush(addr, data);
+  });
 }
 
 CxlMemory::~CxlMemory() {
   delete pHIL;
-  delete[] pages;
-  delete evict_strategy;
-
-  if (munmap(mapped_cache_, CXL_SSD_CAPACITY) == -1) {
-    perror("Error unmapping file from memory");
-  }
+  delete haipc;
+  munmap(mapped_cache_, CXL_SSD_CAPACITY);
   close(data_fd_);
 }
 
 uint8_t *CxlMemory::toHostAddr(Addr addr) {
-  Addr ssd_start = physicalAddrToSSDAddr(addr);
-  return (uint8_t *)mapped_cache_ + ssd_start;
+    return (uint8_t *)mapped_cache_ + physicalAddrToSSDAddr(addr);
+}
+
+void CxlMemory::access(PacketPtr pkt) {
+    // BAR handling for PCI config
+    range_ = AddrRange(BARs[0]->addr(), BARs[0]->addr() + BARs[0]->size());
+
+    // Note: In CXL Type-3, we usually respond to Mem access. 
+    // Checking cacheResponding() prevents double response.
+    if (pkt->cacheResponding()) return;
+    if (pkt->cmd == MemCmd::CleanEvict || pkt->cmd == MemCmd::WritebackClean) return;
+    
+    uint8_t *host_addr = toHostAddr(pkt->getAddr());
+
+    if (pkt->cmd == MemCmd::SwapReq) {
+      if (pkt->isAtomicOp()) {
+        if (mapped_cache_) {
+            pkt->setData(host_addr);
+            (*(pkt->getAtomicOp()))(host_addr);
+        }
+      } else {
+        std::vector<uint8_t> overwrite_val(pkt->getSize());
+        uint64_t condition_val64;
+        uint32_t condition_val32;
+        bool overwrite_mem = true;
+
+        pkt->writeData(&overwrite_val[0]);
+        pkt->setData(host_addr);
+
+        if (pkt->req->isCondSwap()) {
+            if (pkt->getSize() == sizeof(uint64_t)) {
+                condition_val64 = pkt->req->getExtraData();
+                overwrite_mem = !std::memcmp(&condition_val64, host_addr, sizeof(uint64_t));
+            } else if (pkt->getSize() == sizeof(uint32_t)) {
+                condition_val32 = (uint32_t)pkt->req->getExtraData();
+                overwrite_mem = !std::memcmp(&condition_val32, host_addr, sizeof(uint32_t));
+            }
+        }
+        if (overwrite_mem) std::memcpy(host_addr, &overwrite_val[0], pkt->getSize());
+      }
+    } else if (pkt->isRead()) {
+        if (mapped_cache_) pkt->setData(host_addr);
+    } else if (pkt->isWrite()) {
+        if (mapped_cache_) pkt->writeData(host_addr);
+    }
+
+    if (pkt->needsResponse()) pkt->makeResponse();
 }
 
 Tick CxlMemory::read(PacketPtr pkt) {
-  DPRINTF(CxlMemory, "read address : (%lx, %lx)\n", pkt->getAddr(),
-          pkt->getSize());
-  DPRINTF(CxlMemoryCoherency, "read packet: MemCmd %s, address %lx\n",
-          pkt->cmdString(), pkt->getAddr());
-  access_counts_ += 1;
+    // Perform functional access first (get data into packet)
+    access(pkt);
+    
+    Addr addr = physicalAddrToSSDAddr(pkt->getAddr());
+    uint32_t size = pkt->getSize();
 
-  // statistics cache hit
-  // if (access_counts_ % CXL_SSD_CACHE_HIT_STAT == 0) {
-  //   DPRINTF(CxlMemoryCacheHit,
-  //           "CxlSSD cache hit statistics: hit counts: %ld, access counts: "
-  //           "%ld, cache hit rate: %.4lf\n",
-  //           cache_hit_counts_, access_counts_,
-  //           (double)cache_hit_counts_ / access_counts_);
-  // }
+    // 1. Try HAIPC
+    AccessStatus status = haipc->HandleRead(addr, size, mapped_cache_);
+    logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
+    Tick total_latency = cxl_mem_latency_;
 
-  access(pkt); // storage may be dram or SSD
-  Tick cxl_latency = resolve_cxl_mem(pkt);
+    // 檢查是否已經遷移到 Host DRAM
+    if (migrated_pages_.count(lpn)) {
+        DPRINTF(CxlMemory, "Read Redirect to Host DRAM (Simulated): LPN %lu\n", lpn);
+        // 這裡回傳 Host DRAM 的延遲，模擬 "Hit in Host Page Cache"
+        // 雖然 Packet 實際上是走到 CXL Device，但我們假裝它是從 Host DRAM 回來的
+        return host_dram_latency_; 
+    }
 
-#ifdef CXL_MEMORY_ENABLE
-  Tick storage_latency = latency_;
-#else
-  Tick storage_latency = ssdRead(pkt);
-#endif
+    if (status == AccessStatus::HIT) return total_latency;
+    if (status == AccessStatus::ANOMALY_MIGRATE) {
+      migrated_pages_.insert(lpn);
+      return total_latency + 1000;
+    }
 
-  DPRINTF(CxlMemory, "cxl_latency: %ld, read_latency: %ld\n", cxl_latency,
-          storage_latency);
+    // 2. Cache Miss -> Fetch from Flash [cite: 289]
+    Tick flash_latency = ssdRead(pkt); 
 
-  return cxl_latency + storage_latency;
+    // 3. Load to Classify Area
+    // We need to fetch the whole 4KB page that contains this addr
+    // Simulation: We just create a dummy buffer or read from mmap if SSD backend updated it
+    std::vector<uint8_t> page_data(CXL_SSD_PAGE_SIZE, 0); 
+    // In a real impl, ssdRead would populate a buffer. 
+    
+    haipc->InsertToClassify(addr, page_data, mapped_cache_);
+
+    return total_latency + flash_latency;
 }
 
 Tick CxlMemory::write(PacketPtr pkt) {
-  DPRINTF(CxlMemory, "write address : (%lx, %lx)\n", pkt->getAddr(),
-          pkt->getSize());
-  DPRINTF(CxlMemoryCoherency,
-          "write packet: MemCmd %s, address: %lx, req->isClean: %d, "
-          "req->isInvalidate: %d\n",
-          pkt->cmdString(), pkt->getAddr(), pkt->req->isCacheClean(),
-          pkt->req->isCacheInvalidate());
-  access_counts_ += 1;
-
-  // // statistics cache hit
-  // if (access_counts_ % CXL_SSD_CACHE_HIT_STAT == 0) {
-  //   DPRINTF(CxlMemoryCacheHit,
-  //           "CxlSSD cache hit statistics: hit counts: %ld, access counts: "
-  //           "%ld, cache hit rate: %.4lf\n",
-  //           cache_hit_counts_, access_counts_,
-  //           (double)cache_hit_counts_ / access_counts_);
-  // }
-
   access(pkt);
-  Tick cxl_latency = resolve_cxl_mem(pkt);
 
-#ifdef CXL_MEMORY_ENABLE
-  Tick storage_latency = latency_;
-#else
-  Tick storage_latency = ssdWrite(pkt);
-#endif
+  Addr addr = physicalAddrToSSDAddr(pkt->getAddr());
+  logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
+  uint32_t size = pkt->getSize();
+  const uint8_t* data = pkt->getConstPtr<uint8_t>();
 
-  DPRINTF(CxlMemory, "cxl_latency: %ld, write_latency: %ld\n", cxl_latency,
-          storage_latency);
-  return cxl_latency + storage_latency;
-}
-
-AddrRangeList CxlMemory::getAddrRanges() const {
-  return PciDevice::getAddrRanges();
-}
-
-Tick CxlMemory::resolve_cxl_mem(PacketPtr pkt) {
-  if (pkt->cmd == MemCmd::ReadReq) {
-    assert(pkt->isRead());
-    assert(pkt->needsResponse());
-  } else if (pkt->cmd == MemCmd::WriteReq) {
-    assert(pkt->isWrite());
-    assert(pkt->needsResponse());
-  }
-  return cxl_mem_latency_;
-}
-
-// process data
-void CxlMemory::access(PacketPtr pkt) {
-  // get the bar address when linux wirte the corresponding registers
-  range_ = AddrRange(BARs[0]->addr(), BARs[0]->addr() + BARs[0]->size());
-  // DPRINTF(CxlMemory, "range_ addr_ : %lx, size: %lx\n", range_.start(),
-  // range_.size());
-  if (pkt->cacheResponding()) {
-    DPRINTF(CxlMemory, "Cache responding to %#llx: not responding\n",
-            pkt->getAddr());
-    return;
+  // 檢查是否已遷移
+  if (migrated_pages_.count(lpn)) {
+      return host_dram_latency_; // 模擬 Host 處理寫入
   }
 
-  if (pkt->cmd == MemCmd::CleanEvict || pkt->cmd == MemCmd::WritebackClean) {
-    DPRINTF(CxlMemory, "CleanEvict  on 0x%x: not responding\n", pkt->getAddr());
-    return;
+  // 1. Try HAIPC Update
+  AccessStatus status = haipc->HandleWrite(addr, size, data, mapped_cache_);
+
+  if (status == AccessStatus::HIT) {
+    return cxl_mem_latency_;
+  } 
+  else if (status == AccessStatus::ANOMALY_MIGRATE) {
+    // 處理寫入時的遷移
+    migrated_pages_.insert(lpn);
+    // 這裡回傳 CXL Latency + Penalty，因為這次寫入實際上觸發了搬移
+    return cxl_mem_latency_ + migration_penalty_;
   }
 
-  assert(pkt->getAddrRange().isSubset(range_));
-
-  uint8_t *host_addr = toHostAddr(pkt->getAddr());
-
-  if (pkt->cmd == MemCmd::SwapReq) {
-    if (pkt->isAtomicOp()) {
-      if (mapped_cache_) {
-        pkt->setData(host_addr);
-        (*(pkt->getAtomicOp()))(host_addr);
-      }
-    } else {
-      std::vector<uint8_t> overwrite_val(pkt->getSize());
-      uint64_t condition_val64;
-      uint32_t condition_val32;
-
-      if (!mapped_cache_) {
-        panic("Swap only works if there is real memory "
-              "(i.e. null=False)");
-      }
-
-      bool overwrite_mem = true;
-      // keep a copy of our possible write value, and copy what is at the
-      // memory address into the packet
-      pkt->writeData(&overwrite_val[0]);
-      pkt->setData(host_addr);
-
-      if (pkt->req->isCondSwap()) {
-        if (pkt->getSize() == sizeof(uint64_t)) {
-          condition_val64 = pkt->req->getExtraData();
-          overwrite_mem =
-              !std::memcmp(&condition_val64, host_addr, sizeof(uint64_t));
-        } else if (pkt->getSize() == sizeof(uint32_t)) {
-          condition_val32 = (uint32_t)pkt->req->getExtraData();
-          overwrite_mem =
-              !std::memcmp(&condition_val32, host_addr, sizeof(uint32_t));
-        } else
-          panic("Invalid size for conditional read/write\n");
-      }
-
-      if (overwrite_mem)
-        std::memcpy(host_addr, &overwrite_val[0], pkt->getSize());
-
-      assert(!pkt->req->isInstFetch());
-    }
-  } else if (pkt->isRead()) {
-    assert(!pkt->isWrite());
-    if (mapped_cache_) {
-      pkt->setData(host_addr);
-    }
-  } else if (pkt->isWrite()) {
-    if (mapped_cache_) {
-      pkt->writeData(host_addr);
-    }
-    assert(!pkt->req->isInstFetch());
-  } else {
-    panic("Unexpected packet %s", pkt->print());
-  }
-
-  if (pkt->needsResponse()) {
-    pkt->makeResponse();
-  }
+  // 2. Miss -> Flash Write
+  return cxl_mem_latency_ + ssdWrite(pkt);
 }
 
-bool CxlMemory::ssdAddrCheck(PacketPtr &pkt) {
-  Addr pktStart = pkt->getAddr();
-  Addr pktend = pkt->getAddr() + pkt->getSize();
-  return range_.start() <= pktStart &&
-         pktend <= (range_.start() + range_.size());
-}
-
-uint64_t CxlMemory::GetPagesIndex(Addr ssd_start) const {
-  uint64_t tag = ssd_start / logical_page_size_;
-  uint64_t index = tag & (pages_counts - 1);
-  return index;
+void CxlMemory::internalFlush(Addr ssd_addr, uint8_t* data) {
+  uint64_t latency = 0;
+  SimpleSSD::HIL::Request request(&latency);
+  request.reqID = ++instruction_id;
+  request.range.slpn = ssd_addr / CXL_SSD_PAGE_SIZE;
+  request.range.nlp = 1;
+  request.offset = ssd_addr % CXL_SSD_PAGE_SIZE;
+  request.length = CXL_MEM_CHUNK_SIZE;
+  request.function = [](uint64_t, void *) {};
+  
+  pHIL->write(request);
 }
 
 Tick CxlMemory::ssdRead(PacketPtr pkt) {
-  if (!ssdAddrCheck(pkt)) {
-    assert(0);
-  }
-  Tick storage_latency = 0; // record the latency for simplessd
-
-  uint64_t ssd_start = physicalAddrToSSDAddr(pkt->getAddr());
-#ifndef CXL_SSD_NO_CACHE
-  uint64_t logical_frame = ssd_start & (~(logical_page_size_ - 1));
-
-  uint64_t index = evict_strategy->access(logical_frame);
-
-  DPRINTF(CxlMemory, "ssd_read ssd_start: %lx, page_index: %lx\n", ssd_start,
-          index);
-
-  auto &page = pages[index];
-
-  if (page.IsValid() && page.CacheHit(ssd_start)) {
-    cache_hit_counts_ += 1;
-    return latency_;
-  }
-
-  if (page.IsDirty()) {
-    uint64_t dirty_addr_start = page.tag_;
-    uint64_t dirty_page_size = logical_page_size_;
-    uint64_t write_latency = 0;
-
-    SimpleSSD::HIL::Request write_back_request(&write_latency);
-    write_back_request.reqID = ++instruction_id;
-    write_back_request.range.slpn = dirty_addr_start / logical_page_size_;
-    write_back_request.range.nlp = dirty_page_size / logical_page_size_;
-    write_back_request.offset = dirty_addr_start % logical_page_size_;
-    write_back_request.length = dirty_page_size;
-    write_back_request.function = [](uint64_t, void *) {};
-    write_back_request.context = (void *)instruction_id;
-    pHIL->write(write_back_request);
-
-    storage_latency += 35250000; // TODO: need fix this patch, get real latency
-    page.ClearDirty();
-  }
-  page.SetValid();
-  page.SetTag(ssd_start);
-
-#endif
-  uint64_t read_latency = 0;
-  SimpleSSD::HIL::Request request(&read_latency);
+  uint64_t latency = 0;
+  SimpleSSD::HIL::Request request(&latency);
   request.reqID = ++instruction_id;
-  request.range.slpn = ssd_start / logical_page_size_;
-  request.range.nlp = pkt->getSize() / logical_page_size_;
-  request.offset = ssd_start % logical_page_size_;
-  request.length = pkt->getSize();
+  request.range.slpn = physicalAddrToSSDAddr(pkt->getAddr()) / CXL_SSD_PAGE_SIZE;
+  request.range.nlp = 1;
+  request.offset = 0;
+  request.length = CXL_SSD_PAGE_SIZE; // Reading full page from Flash
   request.function = [](uint64_t, void *) {};
-  request.context = (void *)instruction_id;
   pHIL->read(request);
-
-  storage_latency += read_latency * 10;
-
-  DPRINTF(CxlMemory, "ssdread latency %ld, engine current tick %ld\n",
-          storage_latency, engine.getCurrentTick());
-
-  return storage_latency + latency_;
+  return latency;
 }
 
 Tick CxlMemory::ssdWrite(PacketPtr pkt) {
-  if (!ssdAddrCheck(pkt)) {
-    assert(0);
-  }
-  Tick storage_latency = 0;
-
-  uint64_t ssd_start = physicalAddrToSSDAddr(pkt->getAddr());
-#ifndef CXL_SSD_NO_CACHE
-  uint64_t logical_frame = ssd_start & (~(logical_page_size_ - 1));
-
-  uint64_t index = evict_strategy->access(logical_frame);
-
-  DPRINTF(CxlMemory, "ssd_write ssd_start: %lx, page_index: %lx\n", ssd_start,
-          index);
-
-  auto &page = pages[index];
-  if (page.IsValid() && page.CacheHit(ssd_start)) {
-    cache_hit_counts_ += 1;
-    return latency_;
-  }
-
-  if (page.IsDirty()) {
-    uint64_t dirty_addr_start = page.tag_;
-    uint64_t dirty_page_size = logical_page_size_;
-    uint64_t write_latency = 0;
-
-    SimpleSSD::HIL::Request write_back_request(&write_latency);
-    write_back_request.reqID = ++instruction_id;
-    write_back_request.range.slpn = dirty_addr_start / logical_page_size_;
-    write_back_request.range.nlp = dirty_page_size / logical_page_size_;
-    write_back_request.offset = dirty_addr_start % logical_page_size_;
-    write_back_request.length = dirty_page_size;
-    write_back_request.function = [](uint64_t, void *) {};
-    write_back_request.context = (void *)instruction_id;
-    pHIL->write(write_back_request);
-
-    storage_latency += 35250000; // TODO: need fix this patch, get real latency
-    page.ClearDirty();
-  }
-
-  page.SetValid();
-  page.SetTag(ssd_start);
-  page.SetDirty();
-
-  uint64_t read_latency = 0;
-  SimpleSSD::HIL::Request request(&read_latency);
-  request.reqID = ++instruction_id;
-  request.range.slpn = ssd_start / logical_page_size_;
-  request.range.nlp = pkt->getSize() / logical_page_size_;
-  request.offset = ssd_start % logical_page_size_;
-  request.length = pkt->getSize();
-  request.function = [](uint64_t, void *) {};
-  request.context = (void *)instruction_id;
-  pHIL->read(request);
-
-  storage_latency += read_latency * 10;
-
-  DPRINTF(CxlMemory, "ssdwrite latency %ld, engine current tick %ld\n",
-          storage_latency, engine.getCurrentTick());
-#else  // define CXL_SSD_NO_CACHE
-
-  uint64_t write_latency = 0;
-
-  SimpleSSD::HIL::Request write_back_request(&write_latency);
-  write_back_request.reqID = ++instruction_id;
-  write_back_request.range.slpn = ssd_start / logical_page_size_;
-  write_back_request.range.nlp = 1;
-  write_back_request.offset = ssd_start % logical_page_size_;
-  write_back_request.length = logical_page_size_;
-  write_back_request.function = [](uint64_t, void *) {};
-  write_back_request.context = (void *)instruction_id;
-  pHIL->write(write_back_request);
-
-  // storage_latency += 35250000; // TODO: need fix this patch, get real latency
-  storage_latency += write_latency * 10;
-#endif // CXL_SSD_NO_CACHE
-  return storage_latency + latency_;
+    uint64_t latency = 0;
+    SimpleSSD::HIL::Request request(&latency);
+    request.reqID = ++instruction_id;
+    request.range.slpn = physicalAddrToSSDAddr(pkt->getAddr()) / CXL_SSD_PAGE_SIZE;
+    request.range.nlp = 1;
+    request.offset = 0;
+    request.length = CXL_SSD_PAGE_SIZE;
+    request.function = [](uint64_t, void *) {};
+    pHIL->write(request);
+    return latency;
 }
 
+Tick CxlMemory::resolve_cxl_mem(PacketPtr pkt) { return cxl_mem_latency_; }
+AddrRangeList CxlMemory::getAddrRanges() const { return PciDevice::getAddrRanges(); }
+
 } // namespace gem5
+
+

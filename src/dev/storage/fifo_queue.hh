@@ -1,19 +1,23 @@
 #ifndef FIFO_QUEUE_HH_
 #define FIFO_QUEUE_HH_
 
-#include <cstddef>   
-#include <list>       
+#include <cstddef>
+#include <list>
 #include <unordered_map>
-#include <optional> 
+#include <optional>
 #include <stdexcept>
+
+namespace gem5 {
 
 template <typename KeyType, typename ValueType>
 class FIFOQueue {
 private:
-  using ListIterator = typename std::list<ValueType>::iterator;
+  using Element = std::pair<KeyType, ValueType>;
+  using ListIterator = typename std::list<Element>::iterator;
 
   size_t max_size_;
-  std::list<ValueType> fifo_order_;
+  std::list<Element> fifo_order_;
+  
   std::unordered_map<KeyType, ListIterator> map_;
 
 public:
@@ -26,74 +30,79 @@ public:
   FIFOQueue(const FIFOQueue&) = delete;
   FIFOQueue& operator = (const FIFOQueue&) = delete;
 
-  size_t Size() const { 
-    return map_.size(); 
-  }
+  size_t Size() const { return map_.size(); }
+  bool IsFull() const { return map_.size() >= max_size_; }
+  bool IsEmpty() const { return map_.empty(); }
+  bool Contains(const KeyType &key) const { return map_.count(key); }
 
-  bool IsFull() const { 
-    return map_.size() >= max_size_; 
-  }
-
-  bool IsEmpty() const {
-    return map_.empty();
-  }
-
-  bool Contains(const KeyType &key) const {
-    return map_.count(key);
-  }
-
-  ValueType PopFront() {
-    ValueType victim = fifo_order_.front();
-    map_.erase(victim.logical_frame); 
-    fifo_order_.pop_front();
-    return victim;
-  }
-
-  void Insert(const KeyType& key, const ValueType& value) {
-    // 1. 檢查是否已存在 (快取命中) - O(1)
-    if (Contains(key)) {
-      return std::nullopt;
-    }
-
-    // 2. 快取未命中，準備插入
-    std::optional<ValueType> victim = std::nullopt;
-
-    // 3. 檢查是否已滿 - O(1)
-    if (IsFull()) {
-      victim = PopFront();
-    }
-
-    // 4. 插入新元素
-    fifo_order_.push_back(value);
-    map_[key] = std::prev(fifo_order_.end());
-
-    return victim;
-  }
-
+  // 取得 Value 指標 (Element.second)
   ValueType* Get(const KeyType& key) {
     auto map_it = map_.find(key);
-    if (map_it == map_.end()) {
-        return nullptr;
-    }
-    return &(*(map_it->second));
+    if (map_it == map_.end()) return nullptr;
+    // map_it->second 是 list iterator
+    // *(map_it->second) 是 Element (Pair)
+    // .second 才是 Value
+    return &((map_it->second)->second);
   }
 
+  // 插入元素
+  void Insert(const KeyType& key, const ValueType& value) {
+    if (Contains(key)) return; 
+    
+    if (IsFull()) {
+        PopFront();
+    }
+
+    // 這裡會建立一個 pair {key, value} 放入 list
+    fifo_order_.push_back({key, value});
+    map_[key] = std::prev(fifo_order_.end());
+  }
+
+  // 移除並回傳最舊的 Value，同時清理 Map
+  ValueType PopFront() {
+    if (IsEmpty()) throw std::runtime_error("PopFront on empty queue");
+    
+    // 1. 取得 List 頭部的 Key 與 Value
+    // 這裡 fifo_order_.front() 回傳的是 Element (Pair)
+    Element victim_pair = fifo_order_.front();
+    KeyType key = victim_pair.first;
+
+    // 2. 使用 Key 從 Map 中移除 Iterator
+    map_.erase(key);
+    
+    // 3. 從 List 中移除
+    fifo_order_.pop_front();
+    
+    return victim_pair.second;
+  }
+
+  // 偷看最舊的元素 (Element.second)
+  ValueType& PeekFront() {
+      if (IsEmpty()) throw std::runtime_error("PeekFront on empty queue");
+      return fifo_order_.front().second;
+  }
+
+  // 主動移除指定 Key 的元素
   std::optional<ValueType> Remove(const KeyType& key) {
     auto map_it = map_.find(key);
-    if (map_it == map_.end()) {
-        return std::nullopt;
-    }
+    if (map_it == map_.end()) return std::nullopt;
     
-    ValueType node = *(map_it->second); // 拷貝一份
-    fifo_order_.erase(map_it->second);  // 從 list 移除 (O(1))
-    map_.erase(map_it);                 // 從 map 移除 (O(1))
-    return node;
+    // map_it->second 是 list iterator，指向 pair
+    ValueType val = (map_it->second)->second;
+    
+    // 清理 List 和 Map
+    fifo_order_.erase(map_it->second);
+    map_.erase(map_it);
+    
+    return val;
   }
-
+  
   void Clear() {
-    fifo_order_.clear();
-    map_.clear();
+      fifo_order_.clear();
+      map_.clear();
   }
+};
+
 }
 
 #endif // FIFO_QUEUE_HH_
