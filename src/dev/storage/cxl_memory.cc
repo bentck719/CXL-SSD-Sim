@@ -22,6 +22,7 @@ Engine::~Engine() {}
 
 bool Engine::insertEvent(SimpleSSD::Event eid, uint64_t tick, uint64_t *pOldTick) {
   bool found = false;
+  bool flag = false;
   auto insert = eventQueue.end();
 
   for (auto iter = eventQueue.begin(); iter != eventQueue.end(); iter++) {
@@ -185,6 +186,7 @@ AccessStatus BiTieredCache::HandleRead(Addr addr, uint32_t size, char* base_ptr)
         return AccessStatus::HIT; 
     }
     // 2. Check Store
+    ChunkNode* s_node = store_queue->Get(lcn);
     if (store_queue->Contains(lcn)) {
       DPRINTF(CxlMemory, "Read HIT in Store: LCN %lu\n", lcn);
 
@@ -249,7 +251,7 @@ AccessStatus BiTieredCache::HandleWrite(Addr addr, uint32_t size, const uint8_t*
     std::memcpy(buf.data(), base_ptr + src_off, CXL_MEM_CHUNK_SIZE); // Copy old data
     if (size <= CXL_MEM_CHUNK_SIZE) std::memcpy(buf.data(), data, size); // Apply update
 
-    MoveToDirty(lcn, chunk_data, base_ptr);
+    MoveToDirty(lcn, buf, base_ptr);
     return AccessStatus::HIT; // Hit & Handled
   }
 
@@ -412,6 +414,9 @@ CxlMemory::CxlMemory(const Param &p)
     exit(1);
   }
 
+  size_t host_cache_mb = p.host_cache_size / (1024 * 1024);
+  host_cache_tracker = new HostCacheTracker(host_cache_mb);
+
   // Init Cache with Callback to this->internalFlush
   haipc = new BiTieredCache([this](Addr addr, uint8_t* data) {
       this->internalFlush(addr, data);
@@ -480,24 +485,24 @@ Tick CxlMemory::read(PacketPtr pkt) {
     access(pkt);
     
     Addr addr = physicalAddrToSSDAddr(pkt->getAddr());
+    logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
     uint32_t size = pkt->getSize();
-
+    
+    // 檢查是否已經遷移到 Host DRAM
+    if (host_cache_tracker->TryAccess(lpn)) {
+      DPRINTF(CxlMemory, "Read Redirect to Host DRAM (Simulated): LPN %lu\n", lpn);
+      // 這裡回傳 Host DRAM 的延遲，模擬 "Hit in Host Page Cache"
+      // 雖然 Packet 實際上是走到 CXL Device，但我們假裝它是從 Host DRAM 回來的
+      return host_dram_latency_; 
+    }
+    
     // 1. Try HAIPC
     AccessStatus status = haipc->HandleRead(addr, size, mapped_cache_);
-    logical_frame_t lpn = addr / CXL_SSD_PAGE_SIZE;
     Tick total_latency = cxl_mem_latency_;
-
-    // 檢查是否已經遷移到 Host DRAM
-    if (migrated_pages_.count(lpn)) {
-        DPRINTF(CxlMemory, "Read Redirect to Host DRAM (Simulated): LPN %lu\n", lpn);
-        // 這裡回傳 Host DRAM 的延遲，模擬 "Hit in Host Page Cache"
-        // 雖然 Packet 實際上是走到 CXL Device，但我們假裝它是從 Host DRAM 回來的
-        return host_dram_latency_; 
-    }
 
     if (status == AccessStatus::HIT) return total_latency;
     if (status == AccessStatus::ANOMALY_MIGRATE) {
-      migrated_pages_.insert(lpn);
+      host_cache_tracker->Insert(lpn);
       return total_latency + 1000;
     }
 
@@ -524,8 +529,9 @@ Tick CxlMemory::write(PacketPtr pkt) {
   const uint8_t* data = pkt->getConstPtr<uint8_t>();
 
   // 檢查是否已遷移
-  if (migrated_pages_.count(lpn)) {
-      return host_dram_latency_; // 模擬 Host 處理寫入
+  if (host_cache_tracker->TryAccess(lpn)) {
+    DPRINTF(CxlMemory, "Write Redirect to Host DRAM (Simulated Hit): LPN %lu\n", lpn);
+    return host_dram_latency_; // 模擬 Host 處理寫入
   }
 
   // 1. Try HAIPC Update
@@ -536,7 +542,7 @@ Tick CxlMemory::write(PacketPtr pkt) {
   } 
   else if (status == AccessStatus::ANOMALY_MIGRATE) {
     // 處理寫入時的遷移
-    migrated_pages_.insert(lpn);
+    host_cache_tracker->Insert(lpn);
     // 這裡回傳 CXL Latency + Penalty，因為這次寫入實際上觸發了搬移
     return cxl_mem_latency_ + migration_penalty_;
   }

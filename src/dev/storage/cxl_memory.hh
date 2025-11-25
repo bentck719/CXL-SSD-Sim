@@ -123,6 +123,56 @@ public:
     uint64_t GetPhysicalOffset(phys_index_t idx, int area_type); 
 };
 
+class HostCacheTracker {
+private:
+  size_t capacity_pages_;
+  std::list<logical_frame_t> lru_list_;
+  std::unordered_map<logical_frame_t, std::list<logical_frame_t>::iterator> map_;
+
+public:
+  // capacity_mb: Host Page Cache 大小 (例如 8GB)
+  HostCacheTracker(size_t capacity_mb) {
+    // 轉換 MB 為 Page 數量 (4KB per page)
+    // 1 MB = 1024 * 1024 bytes
+    // 1 Page = 4096 bytes
+    // Pages per MB = 256
+    capacity_pages_ = capacity_mb * 256; 
+  }
+
+  // 檢查是否存在，若存在則更新 LRU 位置 (模擬 Host Cache Hit)
+  bool TryAccess(logical_frame_t lpn) {
+    auto it = map_.find(lpn);
+    if (it == map_.end()) {
+        return false; // Miss
+    }
+    // Hit: Move to front (Most Recently Used)
+    lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
+    return true;
+  }
+
+  // 插入新 Page (模擬 Migration)
+  void Insert(logical_frame_t lpn) {
+    if (map_.count(lpn)) {
+      TryAccess(lpn); // 已經存在，更新位置即可
+      return;
+    }
+
+    // 檢查容量，若滿了則 Evict (模擬 Host Eviction)
+    if (map_.size() >= capacity_pages_) {
+      logical_frame_t victim = lru_list_.back();
+      lru_list_.pop_back();
+      map_.erase(victim);
+      // 注意：這裡我們不需要通知 CXL Device。
+      // 因為在真實世界中，Host 丟棄 Clean Page 是無聲的。
+      // 下次 CPU 存取該 victim 時，TryAccess 會回傳 false，
+      // 請求就會自然地流回 CXL Device。
+    }
+
+    lru_list_.push_front(lpn);
+    map_[lpn] = lru_list_.begin();
+  }
+};
+
 class CxlMemory : public PciDevice {
 private:
   AddrRange range_;
@@ -137,8 +187,8 @@ private:
   // The Logic Module
   BiTieredCache *haipc{nullptr}; 
 
-  // Page logically moved to Host DRAM 
-  std::set<logical_frame_t> migrated_pages_;
+  // Pages are logically moved to Host DRAM 
+  HostCacheTracker* host_cache_tracker;
 
   // 定義 Host DRAM 的延遲 (比 CXL 快)
   // 論文數據: DDR5 4KB latency ~106ns

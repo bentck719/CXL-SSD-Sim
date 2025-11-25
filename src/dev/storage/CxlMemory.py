@@ -7,9 +7,10 @@ class CxlMemory(PciDevice):
     type = 'CxlMemory'
     cxx_header = "dev/storage/cxl_memory.hh"
     cxx_class = 'gem5::CxlMemory'
+
     latency = Param.Latency('50ns', "DRAM latency for cxl-SSD")
     cxl_mem_latency = Param.Latency('25ns', "cxl.mem protocol processing's latency for device")
-    # evict_strategy = Param.String("TwoQ", "cxl cache evict strategy, Direct LRU FIFO TwoQ LFRU")
+    host_cache_size = Param.MemorySize("1GB", "Size of the simulated Host DRAM Page Cache")
 
     VendorID = 0x8086
     DeviceID = 0x7890
