@@ -5,7 +5,7 @@
 #include "debug/CxlMemory.hh"
 #include "debug/CxlMemoryCacheHit.hh"
 #include "debug/CxlMemoryCoherency.hh"
-#include "dev/pci/device.hh"
+#include "dev/dma_device.hh"
 #include "dev/storage/simplessd/hil/hil.hh"
 #include "dev/storage/simplessd/util/simplessd.hh"
 #include "dev/storage/fifo_queue.hh"
@@ -22,7 +22,7 @@
 namespace gem5 {
 
 // --- 1. Constants Correction ---
-#define CXL_SSD_CAPACITY        (1LL << 32) // 4GB Total File Size (Example)
+#define CXL_SSD_CAPACITY        (16ULL * 1024 * 1024 * 1024) // 16GB Total File Size (Example)
 #define CXL_SSD_CACHE_CAPACITY  (1LL << 31) // 2GB Device DRAM
 #define CXL_SSD_PAGE_SIZE       (4096)      // 4KB Page Size
 #define CXL_MEM_CHUNK_SIZE      (256)       // 256B Chunk Size
@@ -35,10 +35,6 @@ namespace gem5 {
 #define NUM_CLASSIFY_PAGES (262144)
 #define NUM_STORE_CHUNKS   (2097152)
 #define NUM_DIRTY_CHUNKS   (2097152)
-
-// Thresholds for Anomaly Detection 
-#define THRESHOLD_ISOLATED     (4) // Access count > 4 -> Hotspot
-#define THRESHOLD_DISTRIBUTED  (4) // Unique chunks > 4 -> Block-like
 
 typedef uint64_t Tick;
 typedef uint64_t logical_frame_t; // Page Address (LPN)
@@ -99,6 +95,9 @@ private:
     // Callback to flush data to SSD
     std::function<void(Addr, uint8_t*)> flush_callback;
 
+    uint8_t threshold_isolated_;
+    uint8_t threshold_distributed_;
+
     // Helpers
     phys_index_t AllocateClassifyIndex();
     phys_index_t AllocateStoreIndex();
@@ -113,7 +112,7 @@ private:
     void MoveToDirty(logical_chunk_t chunk_addr, const std::vector<uint8_t>& data, char* base_ptr);
 
 public:
-    BiTieredCache(std::function<void(Addr, uint8_t*)> flush_cb);
+    BiTieredCache(uint8_t t_iso, uint8_t t_dist, std::function<void(Addr, uint8_t*)> flush_cb);
     ~BiTieredCache();
 
     AccessStatus HandleRead(Addr addr, uint32_t size, char* base_ptr);
@@ -123,6 +122,8 @@ public:
     uint64_t GetPhysicalOffset(phys_index_t idx, int area_type); 
 };
 
+// 用來模擬 Anomoly handler 把 in-device page cache 
+// 移動到 host page cache 的管理
 class HostCacheTracker {
 private:
   size_t capacity_pages_;
@@ -173,7 +174,7 @@ public:
   }
 };
 
-class CxlMemory : public PciDevice {
+class CxlMemory : public DmaDevice {
 private:
   AddrRange range_;
   Tick latency_;

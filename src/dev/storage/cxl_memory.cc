@@ -117,8 +117,10 @@ void Engine::deallocateEvent(SimpleSSD::Event eid) {
 // BiTieredCache Implementation
 // ==========================================
 
-BiTieredCache::BiTieredCache(std::function<void(Addr, uint8_t*)> flush_cb) 
-    : flush_callback(flush_cb) {
+BiTieredCache::BiTieredCache(uint8_t t_iso, uint8_t t_dist, std::function<void(Addr, uint8_t*)> flush_cb) 
+    : threshold_isolated_(t_iso), 
+      threshold_distributed_(t_dist),
+      flush_callback(flush_cb) {
     
     classify_queue = new FIFOQueue<logical_frame_t, ClassifyNode>(NUM_CLASSIFY_PAGES);
     store_queue = new FIFOQueue<logical_chunk_t, ChunkNode>(NUM_STORE_CHUNKS);
@@ -194,7 +196,7 @@ AccessStatus BiTieredCache::HandleRead(Addr addr, uint32_t size, char* base_ptr)
       if (s_node->access_count < 255) s_node->access_count++;
 
       // 檢查 Isolated Hotspot
-      if (s_node->access_count > THRESHOLD_ISOLATED) {
+      if (s_node->access_count > threshold_isolated_) {
         DPRINTF(CxlMemory, "Anomaly (Isolated) in Store: LCN %lu\n", lcn);
         // 論文: "For such cases, the entire 4KB page must be reloaded..."
         // 這裡回傳 MIGRATE 信號，CxlMemory 會模擬這個 reload + migrate 的延遲
@@ -210,11 +212,11 @@ AccessStatus BiTieredCache::HandleRead(Addr addr, uint32_t size, char* base_ptr)
         node->AccessChunk(offset_in_page);
 
         // Anomaly Detection
-        if (node->access_counts[offset_in_page] > THRESHOLD_ISOLATED) return AccessStatus::ANOMALY_MIGRATE;
+        if (node->access_counts[offset_in_page] > threshold_isolated_) return AccessStatus::ANOMALY_MIGRATE;
         
         int unique = 0;
         for(int i=0; i < CXL_MEM_CHUNKS_PER_PAGE; ++i) if((node->chunk_bitmap >> i) & 1) unique++;
-        if (unique > THRESHOLD_DISTRIBUTED) return AccessStatus::ANOMALY_MIGRATE;
+        if (unique > threshold_distributed_) return AccessStatus::ANOMALY_MIGRATE;
 
         return AccessStatus::HIT;
     }
@@ -240,7 +242,7 @@ AccessStatus BiTieredCache::HandleWrite(Addr addr, uint32_t size, const uint8_t*
       if((c_node->chunk_bitmap >> i) & 1) unique++;
     }
 
-    if (unique > THRESHOLD_DISTRIBUTED) {
+    if (unique > threshold_distributed_) {
       DPRINTF(CxlMemory, "Anomaly (Distributed) on Write: LPN %lu. Migrating to Host.\n", lpn);
       return AccessStatus::ANOMALY_MIGRATE;
     }
@@ -261,7 +263,7 @@ AccessStatus BiTieredCache::HandleWrite(Addr addr, uint32_t size, const uint8_t*
     // 避免 uint8_t access_count 溢位
     if (s_node->access_count < 255) s_node->access_count++;
 
-    if (s_node->access_count > THRESHOLD_ISOLATED) {
+    if (s_node->access_count > threshold_isolated_) {
       DPRINTF(CxlMemory, "Anomaly (Isolated) on Write in Store: LCN %lu\n", lcn);
       return AccessStatus::ANOMALY_MIGRATE;
     }
@@ -395,8 +397,12 @@ void BiTieredCache::MoveToDirty(logical_chunk_t lcn, const std::vector<uint8_t>&
 // ==========================================
 
 CxlMemory::CxlMemory(const Param &p)
-    : PciDevice(p), latency_(p.latency), cxl_mem_latency_(p.cxl_mem_latency),
+    : DmaDevice(p), 
+      latency_(p.latency), 
+      cxl_mem_latency_(p.cxl_mem_latency),
       pHIL(new SimpleSSD::HIL::HIL(ssdConfig)) {
+      
+  range_ = AddrRange(0x100000000, 0x100000000 + CXL_SSD_CAPACITY);
 
   data_fd_ = open("./CxlSSD.img", O_RDWR | O_CREAT | O_TRUNC, 0666);
   if (data_fd_ == -1) {
@@ -416,9 +422,11 @@ CxlMemory::CxlMemory(const Param &p)
 
   size_t host_cache_mb = p.host_cache_size / (1024 * 1024);
   host_cache_tracker = new HostCacheTracker(host_cache_mb);
+  uint8_t t_iso = p.threshold_isolated;
+  uint8_t t_dist = p.threshold_distributed;
 
   // Init Cache with Callback to this->internalFlush
-  haipc = new BiTieredCache([this](Addr addr, uint8_t* data) {
+  haipc = new BiTieredCache(t_iso, t_dist, [this](Addr addr, uint8_t* data) {
       this->internalFlush(addr, data);
   });
 }
@@ -436,7 +444,7 @@ uint8_t *CxlMemory::toHostAddr(Addr addr) {
 
 void CxlMemory::access(PacketPtr pkt) {
     // BAR handling for PCI config
-    range_ = AddrRange(BARs[0]->addr(), BARs[0]->addr() + BARs[0]->size());
+    // range_ = AddrRange(BARs[0]->addr(), BARs[0]->addr() + BARs[0]->size());
 
     // Note: In CXL Type-3, we usually respond to Mem access. 
     // Checking cacheResponding() prevents double response.
@@ -498,18 +506,14 @@ Tick CxlMemory::read(PacketPtr pkt) {
     
     // 1. Try HAIPC
     AccessStatus status = haipc->HandleRead(addr, size, mapped_cache_);
-    Tick total_latency = cxl_mem_latency_;
 
-    if (status == AccessStatus::HIT) return total_latency;
+    if (status == AccessStatus::HIT) return cxl_mem_latency_ + latency_;
     if (status == AccessStatus::ANOMALY_MIGRATE) {
       host_cache_tracker->Insert(lpn);
-      return total_latency + 1000;
+      return cxl_mem_latency_ + latency_ + ssdRead(pkt) + migration_penalty_;
     }
 
-    // 2. Cache Miss -> Fetch from Flash [cite: 289]
-    Tick flash_latency = ssdRead(pkt); 
-
-    // 3. Load to Classify Area
+    // 2. Load to Classify Area
     // We need to fetch the whole 4KB page that contains this addr
     // Simulation: We just create a dummy buffer or read from mmap if SSD backend updated it
     std::vector<uint8_t> page_data(CXL_SSD_PAGE_SIZE, 0); 
@@ -517,7 +521,7 @@ Tick CxlMemory::read(PacketPtr pkt) {
     
     haipc->InsertToClassify(addr, page_data, mapped_cache_);
 
-    return total_latency + flash_latency;
+    return cxl_mem_latency_ + latency_ + ssdRead(pkt);
 }
 
 Tick CxlMemory::write(PacketPtr pkt) {
@@ -538,17 +542,17 @@ Tick CxlMemory::write(PacketPtr pkt) {
   AccessStatus status = haipc->HandleWrite(addr, size, data, mapped_cache_);
 
   if (status == AccessStatus::HIT) {
-    return cxl_mem_latency_;
+    return cxl_mem_latency_ + latency_;
   } 
   else if (status == AccessStatus::ANOMALY_MIGRATE) {
     // 處理寫入時的遷移
     host_cache_tracker->Insert(lpn);
     // 這裡回傳 CXL Latency + Penalty，因為這次寫入實際上觸發了搬移
-    return cxl_mem_latency_ + migration_penalty_;
+    return cxl_mem_latency_ + latency_ + ssdWrite(pkt) + migration_penalty_;
   }
 
   // 2. Miss -> Flash Write
-  return cxl_mem_latency_ + ssdWrite(pkt);
+  return cxl_mem_latency_ + latency_ + ssdWrite(pkt);
 }
 
 void CxlMemory::internalFlush(Addr ssd_addr, uint8_t* data) {
@@ -591,7 +595,11 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
 }
 
 Tick CxlMemory::resolve_cxl_mem(PacketPtr pkt) { return cxl_mem_latency_; }
-AddrRangeList CxlMemory::getAddrRanges() const { return PciDevice::getAddrRanges(); }
+AddrRangeList CxlMemory::getAddrRanges() const { 
+  AddrRangeList ranges;
+  ranges.push_back(range_);
+  return ranges;
+}
 
 } // namespace gem5
 
