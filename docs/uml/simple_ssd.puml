@@ -1,0 +1,23 @@
+@startuml
+' UML for simple_ssd.hh
+skinparam classAttributeIconSize 0
+
+package "dev/storage/simplessd" {
+  class Engine {
+    - uint64_t simTick
+    - SimpleSSD::Event counter
+    - unordered_map<SimpleSSD::Event, SimpleSSD::EventFunction> eventList
+    - list<pair<SimpleSSD::Event,uint64_t>> eventQueue
+    + getCurrentTick() : uint64_t
+    + allocateEvent(fn) : Event
+    + scheduleEvent(Event, uint64_t)
+    + descheduleEvent(Event)
+    + isScheduled(Event, uint64_t*) : bool
+    + deallocateEvent(Event)
+  }
+}
+
+' relationships
+Engine ..> SimpleSSD::Simulator : implements
+
+@enduml

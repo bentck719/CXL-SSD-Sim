@@ -1,0 +1,52 @@
+@startuml
+' UML for cxl_memory.hh
+skinparam classAttributeIconSize 0
+
+package "dev/storage" {
+  class SSDRequestBuilder {
+    - uint64_t& instruction_id
+    - SimpleSSD::HIL::HIL* pHIL
+    - uint64_t logical_page_size
+    + issueWriteRequest(addr, size) : uint64_t
+    + issueReadRequest(addr, size) : uint64_t
+  }
+
+  class Page {
+    - uint64_t tag_
+    - uint8_t flag_
+    + IsValid() : bool
+    + IsDirty() : bool
+    + SetValid()
+    + SetDirty()
+    + ClearValid()
+    + ClearDirty()
+    + SetTag(tag)
+    + CacheHit(addr) : bool
+  }
+
+  class CxlMemory {
+    - AddrRange range_
+    - Tick latency_
+    - Tick cxl_mem_latency_
+    - SimpleSSD::HIL::HIL* pHIL
+    - int data_fd_
+    - uint64_t instruction_id
+    - uint32_t logical_page_size_
+    - Page* pages
+    - EvictStrategy* evict_strategy
+    + read(pkt) : Tick
+    + write(pkt) : Tick
+    + access(pkt)
+    + getAddrRanges() : AddrRangeList
+    + ssdRead(pkt) : Tick
+    + ssdWrite(pkt) : Tick
+  }
+}
+
+' relationships
+SSDRequestBuilder --> SimpleSSD::HIL::HIL : uses
+CxlMemory "1" *-- "*" Page : manages
+CxlMemory --> EvictStrategy : depends_on
+CxlMemory --> SimpleSSD::HIL::HIL : controls
+
+@enduml

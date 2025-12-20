@@ -1,0 +1,67 @@
+@startuml
+' UML for evict_strategy.hh
+skinparam classAttributeIconSize 0
+
+package "dev/storage" {
+  class FrameAllocator {
+    - frame_id_t max_frames_
+    - frame_id_t next_id_
+    - vector<frame_id_t> free_list_
+    + allocate() : optional<frame_id_t>
+    + deallocate(id)
+  }
+
+  abstract class EvictStrategy {
+    + access(logical_frame_t) : frame_id_t
+  }
+
+  class DirectEvictStrategy {
+    - uint64_t page_counts_
+    + access(logical_frame_t) : frame_id_t
+  }
+
+  class FIFOEvictStrategy {
+    - GeneralQueue<logical_frame_t, frame_id_t> queue_
+    - FrameAllocator allocator_
+    + access(logical_frame_t) : frame_id_t
+  }
+
+  class LRUEvictStrategy {
+    - GeneralQueue<logical_frame_t, frame_id_t> queue_
+    - FrameAllocator allocator_
+    + access(logical_frame_t) : frame_id_t
+  }
+
+  class LFRUEvictStrategy {
+    - set<LFRUNode> cache_set_
+    - unordered_map<logical_frame_t, iterator> map_
+    - FrameAllocator allocator_
+    - uint64_t global_time_
+    + access(logical_frame_t) : frame_id_t
+  }
+
+  class TwoQEvictStrategy {
+    - QueueType fifo_queue_
+    - QueueType lru_queue_
+    - FrameAllocator allocator_
+    + access(logical_frame_t) : frame_id_t
+  }
+}
+
+' relationships
+EvictStrategy <|-- DirectEvictStrategy
+EvictStrategy <|-- FIFOEvictStrategy
+EvictStrategy <|-- LRUEvictStrategy
+EvictStrategy <|-- LFRUEvictStrategy
+EvictStrategy <|-- TwoQEvictStrategy
+
+FrameAllocator --> FIFOEvictStrategy : used_by
+FrameAllocator --> LRUEvictStrategy : used_by
+FrameAllocator --> LFRUEvictStrategy : used_by
+FrameAllocator --> TwoQEvictStrategy : used_by
+
+GeneralQueue <.. FIFOEvictStrategy : composition
+GeneralQueue <.. LRUEvictStrategy : composition
+GeneralQueue <.. TwoQEvictStrategy : composition
+
+@enduml

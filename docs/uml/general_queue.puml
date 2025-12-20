@@ -1,0 +1,23 @@
+@startuml
+' UML for general_queue.hh (template)
+skinparam classAttributeIconSize 0
+
+package "dev/storage" {
+  class GeneralQueue<KeyType, PayloadType> {
+    - size_t max_size_
+    - list<pair<KeyType, PayloadType>> fifo_list_
+    - unordered_map<KeyType, ListIter> map_
+    + GeneralQueue(max_size)
+    + Contains(key) : bool
+    + IsFull() : bool
+    + IsEmpty() : bool
+    + Get(key) : PayloadType*
+    + PeekFront() : KeyType*
+    + Insert(key, value) : optional<pair<KeyType, PayloadType>>
+    + PopFront()
+    + Remove(key)
+    + Promote(key)
+  }
+}
+
+@enduml
