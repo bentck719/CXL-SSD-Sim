@@ -48,6 +48,7 @@ Source('ide_ctrl.cc')
 Source('ide_disk.cc')
 
 Source('cxl_memory.cc')
+Source('simple_ssd.cc')
 
 DebugFlag('CxlMemory')
 DebugFlag('CxlMemoryCacheHit')

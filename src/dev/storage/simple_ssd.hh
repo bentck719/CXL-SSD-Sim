@@ -1,6 +1,5 @@
 #include "dev/storage/simplessd/hil/hil.hh"
 #include "dev/storage/simplessd/util/simplessd.hh"
-#include "dev/storage/simple_ssd.hh"
 #include <unordered_map>
 #include <list>
 
@@ -35,8 +34,4 @@ public:
   bool isScheduled(SimpleSSD::Event, uint64_t * = nullptr) override;
   void deallocateEvent(SimpleSSD::Event) override;
 };
-
-extern Engine engine;
-extern SimpleSSD::ConfigReader ssdConfig;
-
 } // namespace gem5

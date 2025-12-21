@@ -2,6 +2,7 @@
 
 #include "base/trace.hh"
 #include "dev/storage/cxl_memory.hh"
+#include "dev/storage/simple_ssd.hh"
 #include "debug/CxlMemory.hh"
 #include "debug/CxlMemoryCoherency.hh"
 
@@ -27,7 +28,7 @@ EvictStrategy *Worker(EvictStrategyMode mode, size_t capacity) {
   } else if (mode == EvictStrategyMode::TwoQ) {
     return new TwoQEvictStrategy(capacity);
   } else if (mode == EvictStrategyMode::LFRU) {
-    return new LFRUEviceStrategy(capacity);
+    return new LFRUEvictStrategy(capacity);
   }
   assert(0);
 }

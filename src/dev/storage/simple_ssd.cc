@@ -1,6 +1,7 @@
 #include "base/trace.hh"
 #include "dev/storage/simple_ssd.hh"
 
+namespace gem5 {
 /**
  * eventengine for simplessd
  */
@@ -152,4 +153,5 @@ void Engine::deallocateEvent(SimpleSSD::Event eid) {
   } else {
     SimpleSSD::ssd_panic("Event %" PRIu64 " does not exists", eid);
   }
+}
 }
