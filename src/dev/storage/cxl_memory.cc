@@ -469,6 +469,16 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
   Tick storage_latency = 0;
 
   uint64_t ssd_start = physicalAddrToSSDAddr(pkt->getAddr());
+
+  // [COBRA] Connectivity intercept: confirm CXL write reaches SRAM stage
+  if (pkt->isWrite()) {
+    DPRINTF(CxlMemory,
+            "[COBRA Hardware] PONG! Intercepted CXL write at addr: 0x%lx, "
+            "size: %lu\n",
+            pkt->getAddr(), pkt->getSize());
+    return latency_;
+  }
+
 #ifndef CXL_SSD_NO_CACHE
   uint64_t logical_frame = ssd_start & (~(logical_page_size_ - 1));
 
