@@ -1,4 +1,5 @@
 build
+build-cobra
 parser.out
 parsetab.py
 cscope.files

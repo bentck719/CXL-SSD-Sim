@@ -72,7 +72,7 @@ def install_style_hooks(env):
         hook = git_hooks.File(hook_name)
         return hook.exists()
 
-    if hook_exists("pre-commit") and hook_exists("commit-msg"):
+    if not hook_exists("pre-commit") or not hook_exists("commit-msg"):
         return
 
     print(git_style_message, end=" ")
