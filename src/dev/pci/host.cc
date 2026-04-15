@@ -168,9 +168,14 @@ GenericPciHost::write(PacketPtr pkt)
             pkt->getSize());
 
     PciDevice *const pci_dev(getDevice(dev_addr.first));
-    panic_if(!pci_dev,
-             "%02x:%02x.%i: Write to config space on non-existent PCI device\n",
-             dev_addr.first.bus, dev_addr.first.dev, dev_addr.first.func);
+    if (!pci_dev) {
+        warn_once("%02x:%02x.%i: Write to config space on non-existent PCI "
+                  "device, ignoring\n",
+                  dev_addr.first.bus, dev_addr.first.dev,
+                  dev_addr.first.func);
+        pkt->makeAtomicResponse();
+        return 0;
+    }
 
     // @todo Remove this after testing
     pkt->headerDelay = pkt->payloadDelay = 0;
