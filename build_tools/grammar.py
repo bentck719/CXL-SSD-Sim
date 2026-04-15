@@ -25,6 +25,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import os
+import re
 
 import ply.lex
 import ply.yacc
@@ -69,7 +70,11 @@ class Grammar(object):
             return self.yacc_kwargs
 
         if attr == "lex":
-            self.lex = ply.lex.lex(module=self, **self.lex_kwargs)
+            reflags = self.lex_kwargs.pop("reflags", int(re.VERBOSE))
+            reflags |= re.MULTILINE
+            self.lex = ply.lex.lex(
+                module=self, reflags=reflags, **self.lex_kwargs
+            )
             return self.lex
 
         if attr == "yacc":

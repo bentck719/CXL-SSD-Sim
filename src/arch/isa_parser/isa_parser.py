@@ -588,7 +588,7 @@ class ISAParser(Grammar):
     # Change the file suffix of a base filename:
     #   (e.g.) decoder.cc -> decoder-g.cc.inc for 'global' outputs
     def suffixize(self, s, sec):
-        extn = re.compile("(\.[^\.]+)$")  # isolate extension
+        extn = re.compile(r"(\.[^.]+)$")  # isolate extension
         if self.namespace:
             return extn.sub(r"-ns\1.inc", s)  # insert some text on either side
         else:
@@ -681,7 +681,7 @@ class ISAParser(Grammar):
             # is guaranteed to have been written for parse to complete
             f.write('#include "%s"\n' % fn)
 
-        extn = re.compile("(\.[^\.]+)$")
+        extn = re.compile(r"(\.[^.]+)$")
 
         # instruction constructors
         splits = self.splits[self.get_file("decoder")]
@@ -851,7 +851,7 @@ class ISAParser(Grammar):
     # String literal.  Note that these use only single quotes, and
     # can span multiple lines.
     def t_STRLIT(self, t):
-        r"(?m)'([^'])+'"
+        r"'([^']+)'"
         # strip off quotes
         t.value = t.value[1:-1]
         t.lexer.lineno += t.value.count("\n")
@@ -860,7 +860,7 @@ class ISAParser(Grammar):
     # "Code literal"... like a string literal, but delimiters are
     # '{{' and '}}' so they get formatted nicely under emacs c-mode
     def t_CODELIT(self, t):
-        r"(?m)\{\{([^\}]|}(?!\}))+\}\}"
+        r"\{\{([^\}]|}(?!\}))+\}\}"
         # strip off {{ & }}
         t.value = t.value[2:-2]
         t.lexer.lineno += t.value.count("\n")
