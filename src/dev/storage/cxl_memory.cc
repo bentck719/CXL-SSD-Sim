@@ -208,7 +208,7 @@ CxlMemory::CxlMemory(const Param &p)
     assert(0);
   }
   pages = new Page[pages_counts];
-  evict_strategy = Worker(EvictStrategyMode::FIFO, cache_capacity);
+  evict_strategy = Worker(EvictStrategyMode::TwoQ, cache_capacity);
 }
 
 CxlMemory::~CxlMemory() {
@@ -470,15 +470,6 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
 
   uint64_t ssd_start = physicalAddrToSSDAddr(pkt->getAddr());
 
-  // [COBRA] Connectivity intercept: confirm CXL write reaches SRAM stage
-  if (pkt->isWrite()) {
-    DPRINTF(CxlMemory,
-            "[COBRA Hardware] PONG! Intercepted CXL write at addr: 0x%lx, "
-            "size: %lu\n",
-            pkt->getAddr(), pkt->getSize());
-    return latency_;
-  }
-
 #ifndef CXL_SSD_NO_CACHE
   uint64_t logical_frame = ssd_start & (~(logical_page_size_ - 1));
 
@@ -528,6 +519,15 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
   pHIL->read(request);
 
   storage_latency += read_latency * 10;
+
+  // [COBRA] Connectivity intercept: confirm CXL write reaches SRAM stage
+  if (pkt->isWrite()) {
+    DPRINTF(CxlMemory,
+            "[COBRA Hardware] PONG! Intercepted CXL write at addr: 0x%lx, "
+            "size: %lu\n",
+            pkt->getAddr(), pkt->getSize());
+    return latency_;
+  }
 
   DPRINTF(CxlMemory, "ssdwrite latency %ld, engine current tick %ld\n",
           storage_latency, engine.getCurrentTick());

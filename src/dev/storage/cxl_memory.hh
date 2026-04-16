@@ -20,8 +20,7 @@
 
 namespace gem5 {
 
-// #define CXL_SSD_PAGE_LEFT_BITS (12)                       // 12 bit //那这里没进行粒度转换吗？
-#define CXL_SSD_PAGE_LEFT_BITS (10)                       // 10 bit
+#define CXL_SSD_PAGE_LEFT_BITS (12)                       // 12 bit
 #define CXL_SSD_CAPACITY (1LL << 32)                      // 4G capacity
 #define CXL_SSD_CACHE_CAPACITY (1LL << 24)                // 32M capacity
 #define CXL_SSD_PAGE_SIZE (1LL << CXL_SSD_PAGE_LEFT_BITS) // 4K capacity
