@@ -11,6 +11,10 @@
 #include "mem/packet.hh"
 #include "mem/packet_access.hh"
 #include "params/CxlMemory.hh"
+#include "sim/eventq.hh"
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <fcntl.h>
 #include <set>
 #include <sys/mman.h>
@@ -391,12 +395,88 @@ public:
 
 EvictStrategy *Worker(EvictStrategyMode mode, uint64_t capacity);
 
+/* ====================================================================
+ * COBRA Byte-Write Buffer (BWB) — gem5 Hardware Model
+ *
+ * Ring buffer geometry:
+ *   65,536 slots × 4 KB/slot = 256 MB  (must be a power of two)
+ *   Physical_Slot = Log_Index & (BWB_MAX_SLOTS - 1)   [O(1)]
+ *   Log_Tail advances via std::atomic::fetch_add()    [lock-free]
+ *   Log_Head advances during GC/drain (Sprint 4+)
+ *
+ * Set-associative Metadata Array:
+ *   4-way, 16,384 sets  (BWB_MAX_SLOTS / BWB_META_WAYS)
+ *   Set index = lba_page % BWB_META_SETS
+ *   O(1) lookup and O(1) invalidation per set
+ *
+ * BAR2 MMIO Register Map (4 KiB page, host reads via readq/readl):
+ *   0x00  BWB_REG_LOG_TAIL    uint32  RO  monotonically increasing tail
+ *   0x04  BWB_REG_LOG_HEAD    uint32  RO  GC head (always 0 until Sprint 4)
+ *   0x08  BWB_REG_FILL_SLOTS  uint32  RO  occupied slot count
+ *   0x10  BWB_REG_FILL_BYTES  uint64  RO  occupied bytes (fill_slots × 4096)
+ *   0x18  BWB_REG_CAP_SLOTS   uint32  RO  total capacity in slots (65536)
+ *   0x20  BWB_REG_CAP_BYTES   uint64  RO  total capacity in bytes  (256 MB)
+ * ==================================================================== */
+
+static constexpr uint32_t BWB_PAGE_BITS   = 12;                        /* log2(4 KB) */
+static constexpr uint32_t BWB_PAGE_SIZE   = 1u << BWB_PAGE_BITS;       /* 4 096 B    */
+static constexpr uint32_t BWB_MAX_SLOTS   = 65536u;                    /* must be 2^N */
+static constexpr uint64_t BWB_CAPACITY    = (uint64_t)BWB_MAX_SLOTS * BWB_PAGE_SIZE; /* 256 MB */
+static constexpr uint32_t BWB_META_WAYS   = 4u;
+static constexpr uint32_t BWB_META_SETS   = BWB_MAX_SLOTS / BWB_META_WAYS; /* 16 384 */
+
+/* BAR2 register offsets */
+static constexpr uint64_t BWB_REG_LOG_TAIL   = 0x00;
+static constexpr uint64_t BWB_REG_LOG_HEAD   = 0x04;
+static constexpr uint64_t BWB_REG_FILL_SLOTS = 0x08;
+static constexpr uint64_t BWB_REG_FILL_BYTES = 0x10;
+static constexpr uint64_t BWB_REG_CAP_SLOTS  = 0x18;
+static constexpr uint64_t BWB_REG_CAP_BYTES  = 0x20;
+
+/* Background GC watermarks and timing */
+static constexpr uint32_t BWB_GC_HIGH_WM     = BWB_MAX_SLOTS * 85 / 100; /* 55,705 slots */
+static constexpr uint32_t BWB_GC_LOW_WM      = BWB_MAX_SLOTS * 70 / 100; /* 45,875 slots */
+static constexpr Tick     BWB_GC_POLL_TICKS  = 10000000; /* 10 μs @ 1 tick=1 ps (gem5 default) */
+static constexpr uint32_t BWB_GC_BATCH       = 64;      /* max slots drained per wakeup   */
+
+/* Cacheline geometry */
+static constexpr uint32_t BWB_CL_SIZE        = 64;                        /* bytes/cacheline */
+static constexpr uint32_t BWB_CL_PER_PAGE    = BWB_PAGE_SIZE / BWB_CL_SIZE; /* 64 cls/page  */
+
+/**
+ * Per-slot metadata entry in the BWB.
+ *
+ * Tracks the LBA (in 4KB pages), validity, the sub-page dirty bitmap
+ * from the kernel's page_ext (64 cacheline bits per 4KB page), and
+ * the Log_Index used to locate the corresponding data in the ring buffer.
+ */
+struct BwbSlotMeta {
+  uint64_t lba;           /**< 4KB-page-aligned logical block address         */
+  uint64_t dirty_bitmap;  /**< cacheline dirty bits inherited from page_ext   */
+  uint32_t log_index;     /**< Log_Index that allocated this physical slot     */
+  bool     valid;         /**< slot is occupied and not yet drained by GC     */
+
+  void invalidate() { valid = false; }
+};
+
+/**
+ * One set of the 4-way set-associative Metadata Array.
+ *
+ * On a set miss with all ways valid, the entry with the lowest
+ * log_index is evicted (oldest-first policy).  This keeps the metadata
+ * consistent with the ring buffer's FIFO ordering.
+ */
+struct BwbMetaSet {
+  BwbSlotMeta ways[BWB_META_WAYS];
+};
+
 class CxlMemory : public PciDevice {
 private:
   AddrRange range_{0, 1 << 30}; // cpu allocate addr range for cxlssd device
   //  Memory mem_;
-  Tick latency_;
-  Tick cxl_mem_latency_;
+  Tick latency_;           /**< DRAM access latency at the CXL-SSD device (50 ns)          */
+  Tick cxl_mem_latency_;  /**< PCIe + CXL.mem protocol overhead — L_byte component (250 ns) */
+  Tick pcie_latency_;     /**< PCIe DMA setup overhead for NAND block ops — L_block (2280 ns)*/
 
   SimpleSSD::HIL::HIL *pHIL{nullptr};
 
@@ -436,9 +516,90 @@ public:
   Tick ssdWrite(PacketPtr pkt);
   uint64_t GetPagesIndex(Addr ssd_start) const;
 
+  /* ── BWB ring buffer ─────────────────────────────────────────── */
+  uint8_t    *bwb_data_{nullptr};   /**< 256MB contiguous data payload                    */
+  BwbMetaSet *bwb_meta_{nullptr};   /**< 4-way set-associative metadata array              */
+
+  /**
+   * Per-physical-slot reverse LBA map.
+   * bwb_slot_lba_[slot] gives the LBA written to physical slot @p slot.
+   * Updated by bwbWrite(); read by GC for O(1) head→LBA resolution.
+   */
+  uint64_t bwb_slot_lba_[BWB_MAX_SLOTS]{};
+
+  /**
+   * Log_Tail: next free Log_Index.  Advanced by fetch_add(1) on every write.
+   * Log_Head: oldest valid Log_Index.  Advanced by GC drain.
+   * Both are 32-bit unsigned; unsigned subtraction gives correct fill even
+   * after wrap-around.
+   */
+  std::atomic<uint32_t> log_tail_{0};
+  std::atomic<uint32_t> log_head_{0};
+
+  /* ── Background GC state ──────────────────────────────────────── */
+  bool                 gcActive_{false}; /**< true while BWB fill is above HWM  */
+  EventFunctionWrapper gcEvent_;         /**< gem5 recurring poll event          */
+
+  /* ── BWB internal helpers ─────────────────────────────────────── */
+
+  /** Returns the number of occupied slots (saturates at BWB_MAX_SLOTS). */
+  uint32_t bwbFillSlots() const;
+
+  /**
+   * Allocate the next ring buffer slot, copy @p size bytes from @p data,
+   * and record metadata for @p lba.
+   */
+  void bwbWrite(uint64_t lba, const uint8_t *data, uint64_t size,
+                uint64_t dirty_bitmap = ~0ULL);
+
+  /**
+   * Look up the most-recent metadata entry for @p lba.
+   * Returns nullptr if the LBA is not currently in the BWB.
+   * O(BWB_META_WAYS) = O(1).
+   */
+  BwbSlotMeta *bwbLookup(uint64_t lba);
+
+  /**
+   * Logically invalidate all metadata entries for @p lba.
+   * O(BWB_META_WAYS) = O(1).  Data in the ring buffer is NOT zeroed;
+   * the slot will be silently reused when Log_Tail wraps around.
+   */
+  void bwbInvalidate(uint64_t lba);
+
+  /**
+   * Handle a read from BAR2 (BWB MMIO control register page).
+   * Decodes the register offset, populates the packet, and returns
+   * the CXL.mem protocol latency.
+   */
+  Tick handleBar2Read(PacketPtr pkt);
+
+  /* ── Background GC ────────────────────────────────────────────── */
+
+  /** Schedule the next GC wakeup BWB_GC_POLL_TICKS from now. */
+  void scheduleGcPoll();
+
+  /**
+   * One GC wakeup: check watermarks, drain up to BWB_GC_BATCH slots from
+   * Log_Head, validate each against bwb_meta_, flush live slots to NAND,
+   * and reschedule itself.
+   */
+  void runGcStep();
+
+  /* ── I/O Merging helpers ──────────────────────────────────────── */
+
+  /**
+   * For each bit set in @p dirty_bitmap, copy the corresponding 64-byte
+   * cacheline from physical ring-buffer slot @p slot into @p dst.
+   * @p dst must point to the base of the 4KB page.  O(1) — iterates at
+   * most 64 bits.
+   */
+  void bwbOverlayCachelines(uint8_t *dst, uint32_t slot,
+                             uint64_t dirty_bitmap) const;
+
   using Param = CxlMemoryParams;
   CxlMemory(const Param &p);
   ~CxlMemory();
+  void startup() override;
 };
 
 } // namespace gem5
