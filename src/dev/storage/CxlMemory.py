@@ -23,6 +23,14 @@ class CxlMemory(PciDevice):
     pcie_latency    = Param.Latency('2280ns', "PCIe DMA setup/transfer overhead for NAND block operations")
     # evict_strategy = Param.String("TwoQ", "cxl cache evict strategy, Direct LRU FIFO TwoQ LFRU")
 
+    # ── COBRA policy switch ───────────────────────────────────────────────
+    # True  (default): COBRA Phase 2 enabled — SDT policy engine routes
+    #   sparse foreground writes to BWB (NAND skipped) and dense/background
+    #   writes to NAND.  CLWB snooping populates the SDT.
+    # False: pure block-I/O baseline — 100 % of writes go through traditional
+    #   NVMe DMA, SDT disabled.  Use this mode for WAF baseline measurements.
+    enable_cobra_policy = Param.Bool(True, "Enable COBRA Phase 2 SDT policy engine")
+
     VendorID = 0x8086
     DeviceID = 0x7890
     Command = 0x0

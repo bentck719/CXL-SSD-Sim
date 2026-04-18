@@ -184,6 +184,33 @@ EvictStrategy *Worker(EvictStrategyMode mode, uint64_t capacity) {
 }
 
 /**
+ * CxlSsdStats constructor — initialize all scalars with ADD_STAT.
+ */
+CxlMemory::CxlSsdStats::CxlSsdStats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(hostLogicalBytesWritten, statistics::units::Byte::get(),
+               "Host logical bytes written (CLWB byte-path + NVMe block-path combined)"),
+      ADD_STAT(nandPhysicalBytesWritten, statistics::units::Byte::get(),
+               "Physical bytes written to NAND flash (GC, sync, victim evict, block DMA)"),
+      ADD_STAT(sdtDenseBypasses, statistics::units::Count::get(),
+               "4KB pages routed to NAND: N > N_BASE or no SDT record (dense/background)"),
+      ADD_STAT(sdtSparseAbsorptions, statistics::units::Count::get(),
+               "4KB pages absorbed into BWB: N <= N_BASE, NAND write skipped (sparse/foreground)"),
+      ADD_STAT(bwbVictimFlushes, statistics::units::Count::get(),
+               "LRU victim evictions in bwbAllocate() that triggered a forced NAND write"),
+      ADD_STAT(nandRmwCounts, statistics::units::Count::get(),
+               "NAND read-modify-write cycles (read-before-write on ssdWrite cache miss)")
+{
+    using namespace statistics;
+    hostLogicalBytesWritten .flags(total | nonan);
+    nandPhysicalBytesWritten.flags(total | nonan);
+    sdtDenseBypasses        .flags(total | nonan);
+    sdtSparseAbsorptions    .flags(total | nonan);
+    bwbVictimFlushes        .flags(total | nonan);
+    nandRmwCounts           .flags(total | nonan);
+}
+
+/**
  * CxlMemory
  */
 
@@ -191,7 +218,9 @@ CxlMemory::CxlMemory(const Param &p)
     : PciDevice(p), latency_(p.latency), cxl_mem_latency_(p.cxl_mem_latency),
       pcie_latency_(p.pcie_latency),
       pHIL(new SimpleSSD::HIL::HIL(ssdConfig)),
-      gcEvent_([this]{ runGcStep(); }, name() + ".gcEvent") {
+      gcEvent_([this]{ runGcStep(); }, name() + ".gcEvent"),
+      enableCobraPolicy_(p.enable_cobra_policy),
+      stats_(this) {
   data_fd_ = open("./CxlSSD.img", O_RDWR | O_CREAT | O_TRUNC, 0666);
   if (data_fd_ == -1) {
     perror("Error opening file");
@@ -221,11 +250,12 @@ CxlMemory::CxlMemory(const Param &p)
    * (all fields zero / valid=false) so every slot starts as empty.
    * ─────────────────────────────────────────────────────────────── */
   bwb_data_ = new uint8_t[BWB_CAPACITY]();
-  bwb_meta_ = new BwbMetaSet[BWB_META_SETS]();
+  /* bwb_meta_ is a fixed-size class member (256-set × 4-way SRAM array).
+   * Value-initialised by the {} initialiser in the class definition.    */
 
   DPRINTF(CxlMemory,
     "[BWB] Initialised: %u slots × %u B = %lu MB ring buffer, "
-    "%u-way × %u-set metadata array\n",
+    "%u-way × %u-set SRAM metadata array (LRU replacement)\n",
     BWB_MAX_SLOTS, BWB_PAGE_SIZE, BWB_CAPACITY >> 20,
     BWB_META_WAYS, BWB_META_SETS);
 }
@@ -238,7 +268,7 @@ CxlMemory::~CxlMemory() {
   delete[] pages;
   delete evict_strategy;
   delete[] bwb_data_;
-  delete[] bwb_meta_;
+  /* bwb_meta_ is a class member array — no explicit delete needed. */
 
   if (munmap(mapped_cache_, CXL_SSD_CAPACITY) == -1) {
     perror("Error unmapping file from memory");
@@ -301,6 +331,16 @@ Tick CxlMemory::write(PacketPtr pkt) {
           pkt->req->isCacheInvalidate());
   access_counts_ += 1;
 
+  /* ── Flush/Sync command: drain entire BWB to NAND ───────────────────
+   * fsync() eventually issues a Flush command on the cxl.io path.
+   * handleSync() flushes ALL valid BWB/SDT entries — no partial flush.  */
+  if (pkt->isFlush()) {
+    handleSync();
+    if (pkt->needsResponse())
+      pkt->makeResponse();
+    return cxl_mem_latency_;
+  }
+
   /* ── BAR2: ignore writes to the MMIO control page ───────────────── */
   if (BARs[2]->size() > 0 && BARs[2]->range().contains(pkt->getAddr())) {
     DPRINTF(CxlMemory, "[BWB] BAR2 write at offset 0x%lx (ignored)\n",
@@ -310,17 +350,34 @@ Tick CxlMemory::write(PacketPtr pkt) {
     return cxl_mem_latency_;
   }
 
-  /* ── BAR0: data write ───────────────────────────────────────────────
-   * 1. access() commits the payload to mapped_cache_ (read-coherent store).
-   * 2. bwbWrite() logs the write in the BWB ring buffer + metadata array.
-   * 3. ssdWrite() updates the page-cache state and issues SimpleSSD timing.
-   * ─────────────────────────────────────────────────────────────── */
+  /* ── BAR0 cxl.mem byte path: WritebackClean (CLWB from kernel) ─────
+   * access() writes the 64-byte cacheline into mapped_cache_.
+   * snoopClwb() OR-accumulates the precise cacheline bit in the SDT.
+   * Returns cxl.mem latency only — no NAND write, no DMA overhead.
+   * When the policy engine is disabled the CLWB data still lands in
+   * mapped_cache_ (access() runs) but SDT snooping is skipped.        */
+  if (pkt->cmd == MemCmd::WritebackClean) {
+    stats_.hostLogicalBytesWritten += pkt->getSize();
+    access(pkt);
+    if (enableCobraPolicy_)
+      snoopClwb(pkt->getAddr(), pkt->getSize());
+    Tick cxl_latency = resolve_cxl_mem(pkt);
+    DPRINTF(CxlMemory, "[COBRA-SDT] CLWB byte-path addr=0x%lx size=%u "
+            "cxl_latency=%ld cobra_policy=%d\n",
+            pkt->getAddr(), pkt->getSize(), cxl_latency, enableCobraPolicy_);
+    return cxl_latency;
+  }
+
+  /* ── BAR0 cxl.io block path: WriteReq (NVMe DMA from block layer) ──
+   * 1. access() commits the full 4KB payload to mapped_cache_.
+   * 2. bwbWrite() logs the write in the ring buffer + metadata.
+   * 3. ssdWrite() applies the Phase 2 policy engine and writes to NAND
+   *    only if the SDT indicates dense/background I/O (N > N_BASE).   */
+  stats_.hostLogicalBytesWritten += pkt->getSize();
   access(pkt);
 
-  /* BWB tracking: convert BAR0 packet address to a 4KB-page LBA, then
-   * copy from mapped_cache_ (already written by access()) into the slot. */
   uint64_t ssd_start  = physicalAddrToSSDAddr(pkt->getAddr());
-  uint64_t lba        = ssd_start >> BWB_PAGE_BITS;  /* 4KB page number */
+  uint64_t lba        = ssd_start >> BWB_PAGE_BITS;
   uint8_t *host_addr  = toHostAddr(pkt->getAddr());
   bwbWrite(lba, host_addr, pkt->getSize());
 
@@ -364,8 +421,11 @@ void CxlMemory::access(PacketPtr pkt) {
     return;
   }
 
-  if (pkt->cmd == MemCmd::CleanEvict || pkt->cmd == MemCmd::WritebackClean) {
-    DPRINTF(CxlMemory, "CleanEvict  on 0x%x: not responding\n", pkt->getAddr());
+  /* CleanEvict: no data payload, nothing to commit.
+   * WritebackClean (CLWB): data IS present — fall through so the 64-byte
+   * cacheline is written to mapped_cache_ (BWB backing store).          */
+  if (pkt->cmd == MemCmd::CleanEvict) {
+    DPRINTF(CxlMemory, "CleanEvict on 0x%x: no data, skipping\n", pkt->getAddr());
     return;
   }
 
@@ -486,6 +546,7 @@ Tick CxlMemory::ssdRead(PacketPtr pkt) {
     write_back_request.function      = [](uint64_t, void *) {};
     write_back_request.context       = (void *)instruction_id;
     pHIL->write(write_back_request);
+    stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE; /* dirty-eviction on read miss */
 
     /* L_block: PCIe DMA overhead + real NAND write latency */
     storage_latency += pcie_latency_ + write_latency * 10;
@@ -568,6 +629,38 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
 
   uint64_t ssd_start = physicalAddrToSSDAddr(pkt->getAddr());
 
+  /* ── COBRA Phase 2: Hardware Policy Engine ────────────────────────
+   * Gated by enableCobraPolicy_.  When disabled, all block writes fall
+   * through to the standard NAND path (pure baseline mode).
+   * ─────────────────────────────────────────────────────────────── */
+  if (enableCobraPolicy_) {
+    uint64_t     lba  = ssd_start >> BWB_PAGE_BITS;
+    BwbSlotMeta *meta = bwbLookup(lba);
+
+    if (meta) {
+      int N = __builtin_popcountll(meta->dirty_bitmap);
+      if (N <= COBRA_N_BASE) {
+        DPRINTF(CxlMemory,
+          "[COBRA-POLICY] Sparse lba=0x%lx N=%d <= N_BASE=%d "
+          "-> absorbed from BWB, NAND skipped\n", lba, N, COBRA_N_BASE);
+        stats_.sdtSparseAbsorptions += 1;
+        bwbInvalidate(lba);
+        if (pkt->needsResponse()) pkt->makeResponse();
+        return cxl_mem_latency_;
+      }
+      DPRINTF(CxlMemory,
+        "[COBRA-POLICY] Dense lba=0x%lx N=%d > N_BASE=%d "
+        "-> standard NAND write\n", lba, N, COBRA_N_BASE);
+      stats_.sdtDenseBypasses += 1;
+      /* Invalidation is handled by the BWB merge section below. */
+    } else {
+      DPRINTF(CxlMemory,
+        "[COBRA-POLICY] No SDT record for lba=0x%lx "
+        "(background bypass) -> standard NAND write\n", lba);
+      stats_.sdtDenseBypasses += 1;
+    }
+  }
+
   /* ── Block-Write Merging (RAW Consistency) ────────────────────────
    * The kernel routed this write via the block path (NVMe).  Before the
    * data reaches the NAND timing model we check whether the BWB holds
@@ -627,6 +720,7 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
     write_back_request.function      = [](uint64_t, void *) {};
     write_back_request.context       = (void *)instruction_id;
     pHIL->write(write_back_request);
+    stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE; /* dirty-eviction flush */
 
     /* L_block component: PCIe DMA overhead + real NAND write latency */
     storage_latency += pcie_latency_ + write_latency * 10;
@@ -638,8 +732,9 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
   page.SetDirty();
 
   /* ── RMW read-side: load existing NAND page into cache ──────────────
-   * NVMe/NAND block read.  Add pcie_latency_ for the DMA overhead.
+   * This read + subsequent dirty-eviction write is the RMW cycle.
    * ─────────────────────────────────────────────────────────────── */
+  stats_.nandRmwCounts += 1;
   uint64_t read_latency = 0;
   SimpleSSD::HIL::Request request(&read_latency);
   request.reqID         = ++instruction_id;
@@ -669,6 +764,7 @@ Tick CxlMemory::ssdWrite(PacketPtr pkt) {
   write_back_request.context       = (void *)instruction_id;
   pHIL->write(write_back_request);
 
+  stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE; /* direct no-cache NAND write */
   /* L_block: PCIe DMA overhead + real NAND write latency */
   storage_latency += pcie_latency_ + write_latency * 10;
 #endif // CXL_SSD_NO_CACHE
@@ -722,70 +818,120 @@ void CxlMemory::bwbWrite(uint64_t lba, const uint8_t *data, uint64_t size,
   std::memcpy(bwb_data_ + bwb_offset, data, copy_size);
   bwb_slot_lba_[slot] = lba;  /* reverse map: physical slot → LBA */
 
-  /* Step 3 — Update the set-associative metadata.
-   *
-   * Set index: lba % BWB_META_SETS (deterministic, O(1)).
-   * Way selection: prefer an empty way; if all are occupied, evict the
-   * entry with the lowest (oldest) log_index.  This maintains temporal
-   * ordering: the newest metadata for a given LBA always survives,
-   * which is required for correct I/O merging (Sprint 4).             */
-  uint32_t   set_idx  = (uint32_t)(lba % BWB_META_SETS);
-  BwbMetaSet &mset    = bwb_meta_[set_idx];
-
-  int      target_way  = -1;
-  uint32_t oldest_log  = UINT32_MAX;
-  int      oldest_way  = 0;
-
-  for (int w = 0; w < (int)BWB_META_WAYS; ++w) {
-    if (!mset.ways[w].valid) {
-      target_way = w;
-      break;
-    }
-    if (mset.ways[w].log_index < oldest_log) {
-      oldest_log = mset.ways[w].log_index;
-      oldest_way = w;
-    }
-  }
-  if (target_way == -1)
-    target_way = oldest_way;  /* evict oldest entry */
-
-  mset.ways[target_way] = BwbSlotMeta{
-    .lba          = lba,
-    .dirty_bitmap = dirty_bitmap,
-    .log_index    = log_idx,
-    .valid        = true,
-  };
+  /* Step 3 — Allocate (or evict) a metadata entry via LRU policy.
+   * bwbAllocate() finds an invalid way or evicts the LRU victim (flushing
+   * it to NAND).  It returns a pointer with lba set and valid=true.     */
+  BwbSlotMeta *meta = bwbAllocate(lba);
+  meta->dirty_bitmap = dirty_bitmap;
+  meta->log_index    = log_idx;
 
   DPRINTF(CxlMemory,
-    "[BWB] Write slot=%u log_idx=%u lba=0x%lx set=%u way=%u "
+    "[BWB] Write slot=%u log_idx=%u lba=0x%lx set=%u "
     "fill=%u/%u dirty_bitmap=0x%016lx\n",
-    slot, log_idx, lba, set_idx, target_way,
+    slot, log_idx, lba, (uint32_t)(lba % BWB_META_SETS),
     bwbFillSlots(), BWB_MAX_SLOTS, dirty_bitmap);
 }
 
 /**
- * bwbLookup - find the most-recent valid metadata entry for @p lba.
- * Returns nullptr if the LBA is not currently in the BWB.
- * O(BWB_META_WAYS) = O(1).
+ * bwbLookup - associative tag search with LRU promotion.
+ *
+ * Scans all BWB_META_WAYS ways in the addressed set.  On a hit the
+ * matching way's lru_counter is set to the maximum value and all other
+ * valid ways in the same set are decremented, implementing the hardware
+ * "promote-on-access" LRU update in O(Ways) = O(1) time.
+ * Returns nullptr on a miss.
  */
 BwbSlotMeta *CxlMemory::bwbLookup(uint64_t lba) {
   uint32_t   set_idx = (uint32_t)(lba % BWB_META_SETS);
   BwbMetaSet &mset   = bwb_meta_[set_idx];
 
-  /* Among all valid entries for this LBA, return the one with the
-   * highest (most recent) log_index. */
-  BwbSlotMeta *result     = nullptr;
-  uint32_t     best_log   = 0;
-
   for (int w = 0; w < (int)BWB_META_WAYS; ++w) {
     if (mset.ways[w].valid && mset.ways[w].lba == lba) {
-      if (!result || mset.ways[w].log_index > best_log) {
-        result   = &mset.ways[w];
-        best_log = mset.ways[w].log_index;
+      /* LRU promotion: set this way to max, decrement all others */
+      mset.ways[w].lru_counter = BWB_META_WAYS - 1;
+      for (int o = 0; o < (int)BWB_META_WAYS; ++o) {
+        if (o != w && mset.ways[o].valid && mset.ways[o].lru_counter > 0)
+          --mset.ways[o].lru_counter;
       }
+      return &mset.ways[w];
     }
   }
-  return result;
+  return nullptr;
+}
+
+/**
+ * bwbAllocate - allocate a metadata entry for @p lba with LRU replacement.
+ *
+ * Eviction path: if all ways are valid, the way with the lowest
+ * lru_counter is the LRU victim.  Its data is flushed to NAND via
+ * pHIL->write() before the slot is reused — preventing silent data loss.
+ *
+ * Returns a pointer to the newly initialised entry with lba set,
+ * valid=true, dirty_bitmap=0.  Caller must populate log_index and
+ * dirty_bitmap.
+ */
+BwbSlotMeta *CxlMemory::bwbAllocate(uint64_t lba) {
+  uint32_t   set_idx = (uint32_t)(lba % BWB_META_SETS);
+  BwbMetaSet &mset   = bwb_meta_[set_idx];
+
+  /* 1. Try an invalid (empty) way first */
+  for (int w = 0; w < (int)BWB_META_WAYS; ++w) {
+    if (!mset.ways[w].valid) {
+      mset.ways[w].invalidate();
+      mset.ways[w].lba         = lba;
+      mset.ways[w].valid       = true;
+      mset.ways[w].lru_counter = BWB_META_WAYS - 1;
+      for (int o = 0; o < (int)BWB_META_WAYS; ++o) {
+        if (o != w && mset.ways[o].valid && mset.ways[o].lru_counter > 0)
+          --mset.ways[o].lru_counter;
+      }
+      return &mset.ways[w];
+    }
+  }
+
+  /* 2. All ways occupied — select LRU victim (lowest lru_counter) */
+  int victim_way = 0;
+  for (int w = 1; w < (int)BWB_META_WAYS; ++w) {
+    if (mset.ways[w].lru_counter < mset.ways[victim_way].lru_counter)
+      victim_way = w;
+  }
+  BwbSlotMeta &victim = mset.ways[victim_way];
+
+  /* Flush victim page to NAND before reuse */
+  uint64_t write_latency = 0;
+  SimpleSSD::HIL::Request req(&write_latency);
+  req.reqID      = ++instruction_id;
+  req.range.slpn = victim.lba;
+  req.range.nlp  = 1;
+  req.offset     = 0;
+  req.length     = BWB_PAGE_SIZE;
+  req.function   = [](uint64_t, void *) {};
+  req.context    = reinterpret_cast<void *>(static_cast<uintptr_t>(instruction_id));
+  pHIL->write(req);
+
+  stats_.bwbVictimFlushes        += 1;
+  stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE;
+
+  DPRINTF(CxlMemory,
+    "[BWB-ALLOC] LRU evict set=%u victim_way=%d lba=0x%lx "
+    "dirty_bitmap=0x%016lx nand_latency=%lu ns -> new lba=0x%lx\n",
+    set_idx, victim_way, victim.lba, victim.dirty_bitmap,
+    write_latency, lba);
+
+  /* Overwrite victim with the new entry */
+  victim.lba          = lba;
+  victim.dirty_bitmap = 0;
+  victim.log_index    = 0;   /* caller sets this */
+  victim.lru_counter  = BWB_META_WAYS - 1;
+  victim.valid        = true;
+
+  /* Demote all other ways */
+  for (int o = 0; o < (int)BWB_META_WAYS; ++o) {
+    if (o != victim_way && mset.ways[o].valid && mset.ways[o].lru_counter > 0)
+      --mset.ways[o].lru_counter;
+  }
+
+  return &victim;
 }
 
 /**
@@ -946,6 +1092,7 @@ void CxlMemory::runGcStep() {
         pHIL->write(req);
 
         mset.ways[live_way].invalidate();
+        stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE; /* GC drain flush */
 
         DPRINTF(CxlMemory,
                 "[BWB-GC] FLUSH  slot=%u log_idx=%u lba=0x%lx "
@@ -994,6 +1141,124 @@ void CxlMemory::bwbOverlayCachelines(uint8_t *dst, uint32_t slot,
     std::memcpy(dst + cl_off, src + cl_off, BWB_CL_SIZE);
     bm &= bm - 1;                                     /* clear lowest set bit    */
   }
+}
+
+/* ====================================================================
+ * COBRA Phase 2: SDT Snoop & Sync
+ * ==================================================================== */
+
+/**
+ * snoopClwb - SDT update for a WritebackClean (CLWB) packet.
+ *
+ * Called from write() for every cxl.mem byte-path write.  The 64-byte
+ * cacheline payload has already been committed to mapped_cache_ by
+ * access() before this is called.
+ *
+ * Algorithm (O(BWB_META_WAYS) = O(1)):
+ *   1. Convert BAR0 physical address → SSD offset → LBA + cacheline bit.
+ *   2. If an existing BWB entry for this LBA exists, OR in the new bit.
+ *      This accumulates all CLWB pushes for the same page without
+ *      allocating a new ring slot for each 64-byte cacheline.
+ *   3. If no entry exists, allocate a new ring slot seeded from the
+ *      current state of mapped_cache_ for that page, with only the
+ *      specific cacheline bit(s) set in dirty_bitmap.
+ */
+void CxlMemory::snoopClwb(Addr paddr, size_t size) {
+  uint64_t ssd_off  = physicalAddrToSSDAddr(paddr);
+  uint64_t lba      = ssd_off >> BWB_PAGE_BITS;
+
+  /* Compute the cacheline bit range covered by this write. */
+  uint64_t page_off  = ssd_off & (BWB_PAGE_SIZE - 1);
+  uint64_t cl_first  = page_off / BWB_CL_SIZE;
+  uint64_t cl_last   = (page_off + size - 1) / BWB_CL_SIZE;
+  uint64_t new_bits  = 0;
+  for (uint64_t cl = cl_first; cl <= cl_last && cl < BWB_CL_PER_PAGE; ++cl)
+    new_bits |= (1ULL << cl);
+
+  BwbSlotMeta *meta = bwbLookup(lba);
+  if (meta) {
+    /* Hit — accumulate cacheline bits; no ring slot allocation needed. */
+    meta->dirty_bitmap |= new_bits;
+    DPRINTF(CxlMemory,
+      "[SDT] Snoop CLWB UPDATE lba=0x%lx cl_first=%lu cl_last=%lu "
+      "new_bits=0x%016lx accum=0x%016lx\n",
+      lba, cl_first, cl_last, new_bits, meta->dirty_bitmap);
+  } else {
+    /* Miss — allocate a new SRAM entry (evicting LRU victim if needed).
+     * Also allocate a ring data slot so GC/sync can find the payload.  */
+    uint32_t log_idx = log_tail_.fetch_add(1, std::memory_order_acq_rel);
+    uint32_t slot    = log_idx & (BWB_MAX_SLOTS - 1);
+    uint8_t *page_base = reinterpret_cast<uint8_t *>(mapped_cache_)
+                         + lba * BWB_PAGE_SIZE;
+    std::memcpy(bwb_data_ + (uint64_t)slot * BWB_PAGE_SIZE,
+                page_base, BWB_PAGE_SIZE);
+    bwb_slot_lba_[slot] = lba;
+
+    meta               = bwbAllocate(lba);
+    meta->dirty_bitmap = new_bits;
+    meta->log_index    = log_idx;
+
+    DPRINTF(CxlMemory,
+      "[SDT] Snoop CLWB NEW    lba=0x%lx cl_first=%lu cl_last=%lu "
+      "new_bits=0x%016lx slot=%u\n",
+      lba, cl_first, cl_last, new_bits, slot);
+  }
+}
+
+/**
+ * handleSync - full BWB flush to NAND triggered by a Flush/fsync command.
+ *
+ * Iterates the ENTIRE metadata array (all BWB_META_SETS × BWB_META_WAYS
+ * entries) and issues a SimpleSSD write for every valid entry.  After
+ * all entries are flushed, all valid bits are cleared and Log_Head is
+ * advanced to Log_Tail so the ring buffer appears empty.
+ *
+ * Partial-offset logic is STRICTLY FORBIDDEN — every valid page must be
+ * written regardless of how many cachelines are marked dirty.
+ */
+void CxlMemory::handleSync() {
+  uint32_t flushed = 0;
+
+  DPRINTF(CxlMemory,
+    "[COBRA-SYNC] handleSync START — flushing all valid BWB entries\n");
+
+  for (uint32_t s = 0; s < BWB_META_SETS; ++s) {
+    for (uint32_t w = 0; w < (uint32_t)BWB_META_WAYS; ++w) {
+      BwbSlotMeta &m = bwb_meta_[s].ways[w];
+      if (!m.valid)
+        continue;
+
+      uint64_t write_latency = 0;
+      SimpleSSD::HIL::Request req(&write_latency);
+      req.reqID         = ++instruction_id;
+      req.range.slpn    = m.lba;
+      req.range.nlp     = 1;
+      req.offset        = 0;
+      req.length        = BWB_PAGE_SIZE;
+      req.function      = [](uint64_t, void *) {};
+      req.context       = reinterpret_cast<void *>(
+                            static_cast<uintptr_t>(instruction_id));
+      pHIL->write(req);
+
+      stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE; /* handleSync flush */
+
+      DPRINTF(CxlMemory,
+        "[COBRA-SYNC] Flushed lba=0x%lx dirty_bitmap=0x%016lx "
+        "nand_latency=%lu ns\n",
+        m.lba, m.dirty_bitmap, write_latency);
+
+      m.invalidate();
+      ++flushed;
+    }
+  }
+
+  /* Advance Log_Head to Log_Tail: ring buffer is now logically empty. */
+  log_head_.store(log_tail_.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
+
+  DPRINTF(CxlMemory,
+    "[COBRA-SYNC] handleSync DONE — %u pages flushed, SDT cleared\n",
+    flushed);
 }
 
 } // namespace gem5

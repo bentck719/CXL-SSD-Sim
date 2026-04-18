@@ -12,6 +12,8 @@
 #include "mem/packet_access.hh"
 #include "params/CxlMemory.hh"
 #include "sim/eventq.hh"
+#include "base/statistics.hh"
+#include "base/stats/group.hh"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -21,6 +23,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+
+/* COBRA Phase 2: Sub-page Dirty Tracker */
+#define COBRA_N_BASE 16
 
 namespace gem5 {
 
@@ -405,7 +410,7 @@ EvictStrategy *Worker(EvictStrategyMode mode, uint64_t capacity);
  *   Log_Head advances during GC/drain (Sprint 4+)
  *
  * Set-associative Metadata Array:
- *   4-way, 16,384 sets  (BWB_MAX_SLOTS / BWB_META_WAYS)
+ *   4-way, 256 sets  (fixed SRAM budget; 1024 simultaneous LBAs)
  *   Set index = lba_page % BWB_META_SETS
  *   O(1) lookup and O(1) invalidation per set
  *
@@ -423,7 +428,7 @@ static constexpr uint32_t BWB_PAGE_SIZE   = 1u << BWB_PAGE_BITS;       /* 4 096 
 static constexpr uint32_t BWB_MAX_SLOTS   = 65536u;                    /* must be 2^N */
 static constexpr uint64_t BWB_CAPACITY    = (uint64_t)BWB_MAX_SLOTS * BWB_PAGE_SIZE; /* 256 MB */
 static constexpr uint32_t BWB_META_WAYS   = 4u;
-static constexpr uint32_t BWB_META_SETS   = BWB_MAX_SLOTS / BWB_META_WAYS; /* 16 384 */
+static constexpr uint32_t BWB_META_SETS   = 256u;                          /* fixed SRAM budget */
 
 /* BAR2 register offsets */
 static constexpr uint64_t BWB_REG_LOG_TAIL   = 0x00;
@@ -451,12 +456,18 @@ static constexpr uint32_t BWB_CL_PER_PAGE    = BWB_PAGE_SIZE / BWB_CL_SIZE; /* 6
  * the Log_Index used to locate the corresponding data in the ring buffer.
  */
 struct BwbSlotMeta {
-  uint64_t lba;           /**< 4KB-page-aligned logical block address         */
-  uint64_t dirty_bitmap;  /**< cacheline dirty bits inherited from page_ext   */
-  uint32_t log_index;     /**< Log_Index that allocated this physical slot     */
-  bool     valid;         /**< slot is occupied and not yet drained by GC     */
+  uint64_t lba;           /**< 4KB-page-aligned logical block address          */
+  uint64_t dirty_bitmap;  /**< cacheline dirty bits (SDT record)               */
+  uint32_t log_index;     /**< Log_Index that allocated this physical slot      */
+  uint32_t lru_counter;   /**< hardware LRU state: higher = more recently used  */
+  bool     valid;         /**< slot is occupied and not yet drained by GC      */
 
-  void invalidate() { valid = false; }
+  void invalidate() {
+    valid        = false;
+    lba          = 0;
+    dirty_bitmap = 0;
+    lru_counter  = 0;
+  }
 };
 
 /**
@@ -479,6 +490,8 @@ private:
   Tick pcie_latency_;     /**< PCIe DMA setup overhead for NAND block ops — L_block (2280 ns)*/
 
   SimpleSSD::HIL::HIL *pHIL{nullptr};
+
+  bool enableCobraPolicy_; /**< true = COBRA Phase 2 SDT engine; false = pure block-I/O baseline */
 
   // CXL_SSD_CAPACITY mapped region
   int data_fd_{-1};
@@ -517,8 +530,8 @@ public:
   uint64_t GetPagesIndex(Addr ssd_start) const;
 
   /* ── BWB ring buffer ─────────────────────────────────────────── */
-  uint8_t    *bwb_data_{nullptr};   /**< 256MB contiguous data payload                    */
-  BwbMetaSet *bwb_meta_{nullptr};   /**< 4-way set-associative metadata array              */
+  uint8_t    *bwb_data_{nullptr};              /**< 256MB contiguous data payload ring buffer */
+  BwbMetaSet  bwb_meta_[BWB_META_SETS]{};     /**< 256-set × 4-way SRAM metadata array       */
 
   /**
    * Per-physical-slot reverse LBA map.
@@ -560,6 +573,16 @@ public:
   BwbSlotMeta *bwbLookup(uint64_t lba);
 
   /**
+   * Allocate a metadata entry for @p lba using LRU replacement.
+   * If an invalid way exists it is returned immediately.  Otherwise the
+   * way with the lowest lru_counter is chosen as victim, its data is
+   * flushed to NAND via pHIL->write(), and the slot is reused.
+   * Returns a pointer to the newly initialised (valid=true, lba set,
+   * dirty_bitmap=0) entry.  Caller must set log_index and dirty_bitmap.
+   */
+  BwbSlotMeta *bwbAllocate(uint64_t lba);
+
+  /**
    * Logically invalidate all metadata entries for @p lba.
    * O(BWB_META_WAYS) = O(1).  Data in the ring buffer is NOT zeroed;
    * the slot will be silently reused when Log_Tail wraps around.
@@ -595,6 +618,51 @@ public:
    */
   void bwbOverlayCachelines(uint8_t *dst, uint32_t slot,
                              uint64_t dirty_bitmap) const;
+
+  /* ── COBRA Phase 2: SDT Snoop + Sync ─────────────────────────────── */
+
+  /**
+   * snoopClwb — called for every WritebackClean (CLWB) packet on BAR0.
+   * Translates the physical address to an LBA + cacheline bit and ORs
+   * it into the BWB metadata dirty_bitmap for that page.  If no entry
+   * exists yet for the LBA, a new BWB slot is allocated.  Returns
+   * immediately without issuing any NAND I/O — this is the byte path.
+   */
+  void snoopClwb(Addr paddr, size_t size);
+
+  /**
+   * handleSync — triggered by a Flush/Sync command (fsync).
+   * Iterates the ENTIRE metadata array, flushes every valid BWB entry
+   * to NAND, then clears all valid bits and resets the ring pointers.
+   * Strictly full-BWB flush — partial-offset logic is forbidden.
+   */
+  void handleSync();
+
+  /* ── Storage statistics ──────────────────────────────────────────────
+   * Collected for WAF analysis and COBRA efficiency measurement.
+   * WAF = nandPhysicalBytesWritten / hostLogicalBytesWritten
+   * ─────────────────────────────────────────────────────────────── */
+  struct CxlSsdStats : public statistics::Group {
+    CxlSsdStats(statistics::Group *parent);
+
+    /** Logical bytes written by the host (CLWB byte-path + NVMe block-path). */
+    statistics::Scalar hostLogicalBytesWritten;
+
+    /** Physical bytes written to NAND flash (all paths: GC, sync, victim evict, block DMA). */
+    statistics::Scalar nandPhysicalBytesWritten;
+
+    /** 4KB pages routed to NAND: N > N_BASE or no SDT entry (dense/background). */
+    statistics::Scalar sdtDenseBypasses;
+
+    /** 4KB pages absorbed into BWB: N ≤ N_BASE (sparse/foreground, NAND skipped). */
+    statistics::Scalar sdtSparseAbsorptions;
+
+    /** LRU victim evictions in bwbAllocate() that triggered a forced NAND write. */
+    statistics::Scalar bwbVictimFlushes;
+
+    /** NAND read-modify-write cycles: read-before-write on ssdWrite() cache miss. */
+    statistics::Scalar nandRmwCounts;
+  } stats_;
 
   using Param = CxlMemoryParams;
   CxlMemory(const Param &p);

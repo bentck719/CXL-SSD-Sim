@@ -298,6 +298,8 @@ PciDevice::writeConfig(PacketPtr pkt)
             default:
                 panic("invalid access size(?) for PCI configspace!\n");
         }
+        pkt->makeAtomicResponse();
+        return configDelay;
     } else if (offset > PCI_CONFIG_SIZE) {
         panic("Out-of-range access to PCI config space!\n");
     }
@@ -322,7 +324,9 @@ PciDevice::writeConfig(PacketPtr pkt)
           case PCI_REVISION_ID:
             break;
           default:
-            panic("writing to a read only register");
+            DPRINTF(PciDevice,
+                "writeConfig: unhandled 1-byte write to reg %#x (ignored)\n",
+                offset);
         }
         DPRINTF(PciDevice,
             "writeConfig: dev %#x func %#x reg %#x 1 bytes: data = %#x\n",
@@ -343,7 +347,9 @@ PciDevice::writeConfig(PacketPtr pkt)
             config.cacheLineSize = pkt->getLE<uint8_t>();
             break;
           default:
-            panic("writing to a read only register");
+            DPRINTF(PciDevice,
+                "writeConfig: unhandled 2-byte write to reg %#x (ignored)\n",
+                offset);
         }
         DPRINTF(PciDevice,
             "writeConfig: dev %#x func %#x reg %#x 2 bytes: data = %#x\n",
