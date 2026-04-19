@@ -73,13 +73,16 @@ class PyEvent : public Event
     }
 
     void process() override {
-        // Call the Python implementation as __call__. This provides a
-        // slightly more Python-friendly interface.
-        PYBIND11_OVERLOAD_PURE_NAME(void, PyEvent, "__call__", process);
+        // Acquire the GIL before calling back into Python. In KVM mode
+        // the event queue is drained from a C++ thread that does not hold
+        // the GIL, so we must acquire it here or pybind11 will abort.
+        pybind11::gil_scoped_acquire acquire;
+        PYBIND11_OVERRIDE_PURE_NAME(void, PyEvent, "__call__", process);
     }
 
   protected:
     void acquireImpl() override {
+        pybind11::gil_scoped_acquire acquire;
         py::object obj = py::cast(this);
 
         if (obj) {
@@ -90,6 +93,7 @@ class PyEvent : public Event
     }
 
     void releaseImpl() override {
+        pybind11::gil_scoped_acquire acquire;
         py::object obj = py::cast(this);
 
         if (obj) {

@@ -169,8 +169,13 @@ namespace X86ISA {
                 }
                 break;
               case FamilyModelStepping:
+                // ECX: clear bit 20 (SSE4.2/pcmpistri/crc32) and bit 1
+                // (PCLMULQDQ) — both are unimplemented in this gem5 ISA.
+                // Hiding them prevents glibc from selecting pcmpistri-based
+                // strlen/memchr paths that would corrupt ECX (WarnUnimpl
+                // no-op), causing cascading SIGSEGV in the O3 simulation.
                 result = CpuidResult(0x00020f51, 0x00000805,
-                                     0xefdbfbff, 0x00000209);
+                                     0xefcbfbfd, 0x00000209);
                 break;
               case ExtendedFeatures:
                 result = CpuidResult(0x00000000, 0x01800000,
