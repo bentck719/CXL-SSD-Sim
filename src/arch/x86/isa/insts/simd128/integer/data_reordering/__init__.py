@@ -38,6 +38,7 @@ categories = [
     "unpack_and_interleave",
     "extract_and_insert",
     "shuffle",
+    "palignr",
 ]
 
 microcode = """
