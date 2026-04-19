@@ -664,6 +664,10 @@ public:
     statistics::Scalar nandRmwCounts;
   } stats_;
 
+  /* ── Checkpoint serialization ──────────────────────────────────────── */
+  void serialize(CheckpointOut &cp) const override;
+  void unserialize(CheckpointIn &cp) override;
+
   using Param = CxlMemoryParams;
   CxlMemory(const Param &p);
   ~CxlMemory();

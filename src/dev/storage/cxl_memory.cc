@@ -221,14 +221,21 @@ CxlMemory::CxlMemory(const Param &p)
       gcEvent_([this]{ runGcStep(); }, name() + ".gcEvent"),
       enableCobraPolicy_(p.enable_cobra_policy),
       stats_(this) {
-  data_fd_ = open("./CxlSSD.img", O_RDWR | O_CREAT | O_TRUNC, 0666);
+  data_fd_ = open("./CxlSSD.img", O_RDWR | O_CREAT, 0666);
   if (data_fd_ == -1) {
     perror("Error opening file");
     assert(0);
   }
-  if (ftruncate(data_fd_, CXL_SSD_CAPACITY) == -1) {
-    perror("Error setting file size");
-    assert(0);
+  // Only extend the file if it is smaller than the required capacity.
+  // On a fresh run the file starts at 0 bytes; ftruncate fills with zeros
+  // (sparse).  On checkpoint restore the file already holds SSD data and
+  // must NOT be truncated — that would destroy the checkpointed NAND state.
+  struct stat st;
+  if (fstat(data_fd_, &st) == -1 || (uint64_t)st.st_size < CXL_SSD_CAPACITY) {
+    if (ftruncate(data_fd_, CXL_SSD_CAPACITY) == -1) {
+      perror("Error setting file size");
+      assert(0);
+    }
   }
 
   mapped_cache_ = (char *)mmap(NULL, CXL_SSD_CAPACITY, PROT_READ | PROT_WRITE,
@@ -282,6 +289,98 @@ void CxlMemory::startup() {
   DPRINTF(CxlMemory, "[BWB-GC] Background GC scheduled (poll every %lu ticks, "
           "HWM=%u LWM=%u slots)\n",
           BWB_GC_POLL_TICKS, BWB_GC_HIGH_WM, BWB_GC_LOW_WM);
+}
+
+/* ── Checkpoint serialization ─────────────────────────────────────────────
+ *
+ * We persist the ring-buffer pointers, GC state, the SRAM metadata array,
+ * and the per-slot reverse LBA map.  The 256 MB bwb_data_ ring buffer is
+ * NOT checkpointed: it is a write-back cache of mapped_cache_ (CxlSSD.img),
+ * which is already durable on disk.  The snoopClwb() accumulation path
+ * re-populates individual bwb_data_ slots from mapped_cache_ on the first
+ * CLWB after restore, so correctness is preserved without 256 MB of I/O.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+void CxlMemory::serialize(CheckpointOut &cp) const {
+  PciDevice::serialize(cp);
+
+  uint32_t log_tail = log_tail_.load(std::memory_order_relaxed);
+  uint32_t log_head = log_head_.load(std::memory_order_relaxed);
+  SERIALIZE_SCALAR(log_tail);
+  SERIALIZE_SCALAR(log_head);
+  SERIALIZE_SCALAR(gcActive_);
+  SERIALIZE_SCALAR(instruction_id);
+
+  SERIALIZE_ARRAY(bwb_slot_lba_, BWB_MAX_SLOTS);
+
+  /* Flatten the 2-D bwb_meta_ array into five parallel 1-D arrays so that
+   * gem5's text-format checkpoint can encode each primitive type directly. */
+  constexpr uint32_t META_TOTAL = BWB_META_SETS * BWB_META_WAYS;
+  uint64_t meta_lba         [META_TOTAL];
+  uint64_t meta_dirty_bitmap[META_TOTAL];
+  uint32_t meta_log_index   [META_TOTAL];
+  uint32_t meta_lru_counter [META_TOTAL];
+  uint8_t  meta_valid       [META_TOTAL]; /* bool → uint8_t for safe serialization */
+
+  for (uint32_t s = 0; s < BWB_META_SETS; ++s) {
+    for (uint32_t w = 0; w < BWB_META_WAYS; ++w) {
+      uint32_t idx = s * BWB_META_WAYS + w;
+      const BwbSlotMeta &m = bwb_meta_[s].ways[w];
+      meta_lba         [idx] = m.lba;
+      meta_dirty_bitmap[idx] = m.dirty_bitmap;
+      meta_log_index   [idx] = m.log_index;
+      meta_lru_counter [idx] = m.lru_counter;
+      meta_valid       [idx] = m.valid ? 1u : 0u;
+    }
+  }
+  SERIALIZE_ARRAY(meta_lba,          META_TOTAL);
+  SERIALIZE_ARRAY(meta_dirty_bitmap, META_TOTAL);
+  SERIALIZE_ARRAY(meta_log_index,    META_TOTAL);
+  SERIALIZE_ARRAY(meta_lru_counter,  META_TOTAL);
+  SERIALIZE_ARRAY(meta_valid,        META_TOTAL);
+}
+
+void CxlMemory::unserialize(CheckpointIn &cp) {
+  PciDevice::unserialize(cp);
+
+  uint32_t log_tail = 0, log_head = 0;
+  UNSERIALIZE_SCALAR(log_tail);
+  UNSERIALIZE_SCALAR(log_head);
+  log_tail_.store(log_tail, std::memory_order_relaxed);
+  log_head_.store(log_head, std::memory_order_relaxed);
+  UNSERIALIZE_SCALAR(gcActive_);
+  UNSERIALIZE_SCALAR(instruction_id);
+
+  UNSERIALIZE_ARRAY(bwb_slot_lba_, BWB_MAX_SLOTS);
+
+  constexpr uint32_t META_TOTAL = BWB_META_SETS * BWB_META_WAYS;
+  uint64_t meta_lba         [META_TOTAL];
+  uint64_t meta_dirty_bitmap[META_TOTAL];
+  uint32_t meta_log_index   [META_TOTAL];
+  uint32_t meta_lru_counter [META_TOTAL];
+  uint8_t  meta_valid       [META_TOTAL];
+
+  UNSERIALIZE_ARRAY(meta_lba,          META_TOTAL);
+  UNSERIALIZE_ARRAY(meta_dirty_bitmap, META_TOTAL);
+  UNSERIALIZE_ARRAY(meta_log_index,    META_TOTAL);
+  UNSERIALIZE_ARRAY(meta_lru_counter,  META_TOTAL);
+  UNSERIALIZE_ARRAY(meta_valid,        META_TOTAL);
+
+  for (uint32_t s = 0; s < BWB_META_SETS; ++s) {
+    for (uint32_t w = 0; w < BWB_META_WAYS; ++w) {
+      uint32_t idx = s * BWB_META_WAYS + w;
+      BwbSlotMeta &m = bwb_meta_[s].ways[w];
+      m.lba          = meta_lba         [idx];
+      m.dirty_bitmap = meta_dirty_bitmap[idx];
+      m.log_index    = meta_log_index   [idx];
+      m.lru_counter  = meta_lru_counter [idx];
+      m.valid        = (meta_valid[idx] != 0);
+    }
+  }
+
+  DPRINTF(CxlMemory,
+    "[CKPT] Restored: log_tail=%u log_head=%u gcActive=%d instruction_id=%lu\n",
+    log_tail, log_head, gcActive_, instruction_id);
 }
 
 uint8_t *CxlMemory::toHostAddr(Addr addr) {
@@ -509,46 +608,106 @@ Tick CxlMemory::ssdRead(PacketPtr pkt) {
   if (!ssdAddrCheck(pkt)) {
     assert(0);
   }
-  Tick storage_latency = 0; // record the latency for simplessd
+  Tick storage_latency = 0;
 
   uint64_t ssd_start = physicalAddrToSSDAddr(pkt->getAddr());
+  uint64_t lba       = ssd_start >> BWB_PAGE_BITS;
+  uint64_t page_off  = ssd_start & (BWB_PAGE_SIZE - 1);
+
+  /* ── Step 1: BWB (SDT) lookup — check before DRAM cache and NAND ──────
+   *
+   * The BWB is the most up-to-date store for any LBA that has received
+   * CLWB byte-path writes since the last GC flush.  mapped_cache_ is
+   * always the authoritative backing store (access() keeps it current),
+   * so the packet payload is already correct from the access() call in
+   * read().  Here we only decide LATENCY and whether NAND timing applies.
+   *
+   * Full BWB hit  (all requested cachelines covered by dirty_bitmap):
+   *   → Return cxl_mem_latency_ only.  No NAND read needed.
+   *
+   * Partial / No BWB hit:
+   *   → Fall through to DRAM cache / NAND path below for correct timing.
+   *   → mapped_cache_ already has the freshest data; NO extra overlay
+   *     copy is needed or performed (see Bug Note below).
+   *
+   * Bug Note: the previous implementation overlaid bwb_data_ onto the
+   * packet buffer AFTER access() had already filled it from mapped_cache_.
+   * Because snoopClwb() didn't sync bwb_data_ on accumulation, bwb_data_
+   * could be stale for cachelines written after the first CLWB to an LBA,
+   * causing the overlay to corrupt the correct mapped_cache_ data — the
+   * root cause of the observed segmentation fault.  The overlay is now
+   * removed; bwb_data_ is kept in sync by snoopClwb() for the write-path
+   * merge in ssdWrite() which does still need it.
+   * ─────────────────────────────────────────────────────────────── */
+  {
+    BwbSlotMeta *meta = bwbLookup(lba);
+    if (meta) {
+      /* Compute the bitmask of cachelines the packet spans. */
+      uint64_t cl_first    = page_off / BWB_CL_SIZE;
+      uint64_t cl_last     = (page_off + pkt->getSize() - 1) / BWB_CL_SIZE;
+      uint64_t needed_bits = 0;
+      for (uint64_t cl = cl_first; cl <= cl_last && cl < BWB_CL_PER_PAGE; ++cl)
+        needed_bits |= (1ULL << cl);
+
+      if ((meta->dirty_bitmap & needed_bits) == needed_bits) {
+        /* Full BWB hit: packet payload already correct from access().
+         * Return byte-path latency — no NAND access required.          */
+        DPRINTF(CxlMemory,
+          "[BWB-READ-HIT] Full hit lba=0x%lx page_off=0x%lx "
+          "pkt_size=%u needed=0x%016lx bitmap=0x%016lx\n",
+          lba, page_off, pkt->getSize(), needed_bits, meta->dirty_bitmap);
+        return cxl_mem_latency_;
+      }
+
+      /* Partial hit: some CLs in BWB, rest needs NAND timing.
+       * mapped_cache_ is authoritative for ALL CLs (CLWB and block path
+       * both update it), so the packet data from access() is already
+       * correct.  We only add NAND timing below.                       */
+      DPRINTF(CxlMemory,
+        "[BWB-READ-PARTIAL] lba=0x%lx needed=0x%016lx bitmap=0x%016lx "
+        "-> NAND timing added\n",
+        lba, needed_bits, meta->dirty_bitmap);
+    }
+  }
+
+  /* ── Step 2: DRAM page cache + NAND timing ───────────────────────────
+   * mapped_cache_ (populated by access()) already holds the correct data.
+   * What follows is purely latency accounting — no additional data copies.
+   * ─────────────────────────────────────────────────────────────── */
 #ifndef CXL_SSD_NO_CACHE
   uint64_t logical_frame = ssd_start & (~(logical_page_size_ - 1));
+  uint64_t index         = evict_strategy->access(logical_frame);
 
-  uint64_t index = evict_strategy->access(logical_frame);
-
-  DPRINTF(CxlMemory, "ssd_read ssd_start: %lx, page_index: %lx\n", ssd_start,
-          index);
+  DPRINTF(CxlMemory, "ssd_read ssd_start: %lx, page_index: %lx\n",
+          ssd_start, index);
 
   auto &page = pages[index];
 
   if (page.IsValid() && page.CacheHit(ssd_start)) {
     cache_hit_counts_ += 1;
+    /* DRAM cache hit: packet already correct from access(); DRAM latency. */
     return latency_;
   }
 
   if (page.IsDirty()) {
-    /* ── Dirty-page writeback before read ────────────────────────────
+    /* ── Dirty-page writeback before read ──────────────────────────────
      * Must evict the dirty occupant to NAND before loading the new page.
-     * L_block: pcie_latency_ (2280 ns PCIe DMA) + real SimpleSSD NAND
-     * write timing.  Replaces the old hardcoded 35250000 (~35 ms).
      * ─────────────────────────────────────────────────────────────── */
     uint64_t dirty_addr_start = page.tag_;
     uint64_t dirty_page_size  = logical_page_size_;
     uint64_t write_latency    = 0;
 
     SimpleSSD::HIL::Request write_back_request(&write_latency);
-    write_back_request.reqID         = ++instruction_id;
-    write_back_request.range.slpn    = dirty_addr_start / logical_page_size_;
-    write_back_request.range.nlp     = dirty_page_size  / logical_page_size_;
-    write_back_request.offset        = dirty_addr_start % logical_page_size_;
-    write_back_request.length        = dirty_page_size;
-    write_back_request.function      = [](uint64_t, void *) {};
-    write_back_request.context       = (void *)instruction_id;
+    write_back_request.reqID      = ++instruction_id;
+    write_back_request.range.slpn = dirty_addr_start / logical_page_size_;
+    write_back_request.range.nlp  = dirty_page_size  / logical_page_size_;
+    write_back_request.offset     = dirty_addr_start % logical_page_size_;
+    write_back_request.length     = dirty_page_size;
+    write_back_request.function   = [](uint64_t, void *) {};
+    write_back_request.context    = (void *)instruction_id;
     pHIL->write(write_back_request);
-    stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE; /* dirty-eviction on read miss */
+    stats_.nandPhysicalBytesWritten += BWB_PAGE_SIZE;
 
-    /* L_block: PCIe DMA overhead + real NAND write latency */
     storage_latency += pcie_latency_ + write_latency * 10;
     page.ClearDirty();
   }
@@ -556,67 +715,29 @@ Tick CxlMemory::ssdRead(PacketPtr pkt) {
   page.SetTag(ssd_start);
 
 #endif
-  /* ── NAND read to fill the cache slot ────────────────────────────────
-   * L_block: pcie_latency_ (2280 ns) + real SimpleSSD NAND read timing.
-   * ─────────────────────────────────────────────────────────────── */
+  /* ── NAND read timing (data already in packet from access()) ─────── */
   uint64_t read_latency = 0;
   SimpleSSD::HIL::Request request(&read_latency);
-  request.reqID         = ++instruction_id;
-  request.range.slpn    = ssd_start / logical_page_size_;
-  request.range.nlp     = pkt->getSize() / logical_page_size_;
-  request.offset        = ssd_start % logical_page_size_;
-  request.length        = pkt->getSize();
-  request.function      = [](uint64_t, void *) {};
-  request.context       = (void *)instruction_id;
+  request.reqID      = ++instruction_id;
+  request.range.slpn = ssd_start / logical_page_size_;
+  request.range.nlp  = pkt->getSize() / logical_page_size_;
+  request.offset     = ssd_start % logical_page_size_;
+  request.length     = pkt->getSize();
+  request.function   = [](uint64_t, void *) {};
+  request.context    = (void *)instruction_id;
   pHIL->read(request);
 
-  /* L_block: PCIe DMA overhead + real NAND read latency */
   storage_latency += pcie_latency_ + read_latency * 10;
 
-  DPRINTF(CxlMemory, "[ssdRead] cache-miss latency %ld ns, simTick %ld\n",
+  DPRINTF(CxlMemory, "[ssdRead] NAND-miss latency %ld ns, simTick %ld\n",
           storage_latency, engine.getCurrentTick());
 
-  /* ── Block-Read Merging (Overlay) ─────────────────────────────────
-   * NAND timing has been accounted for above.  Before returning the
-   * packet to the host, overlay any dirty BWB cachelines for this LBA.
-   * The packet data was populated by access() from mapped_cache_, which
-   * reflects the DRAM-side view.  BWB data may be newer for specific
-   * cachelines if a byte-path write raced with this block read (e.g. the
-   * kernel's page was partially reclaimed between the two operations).
-   * We do NOT invalidate the BWB entry here — the data remains live for
-   * a future NAND flush via GC or a subsequent block write.
-   * ─────────────────────────────────────────────────────────────── */
-  {
-    uint64_t     lba      = ssd_start >> BWB_PAGE_BITS;
-    uint64_t     page_off = ssd_start & (BWB_PAGE_SIZE - 1);
-    BwbSlotMeta *meta     = bwbLookup(lba);
-    if (meta) {
-      uint32_t       slot     = meta->log_index & (BWB_MAX_SLOTS - 1);
-      uint8_t       *pkt_data = pkt->getPtr<uint8_t>();
-      const uint8_t *bwb_page = bwb_data_ + (uint64_t)slot * BWB_PAGE_SIZE;
-      uint64_t       bm       = meta->dirty_bitmap;
-
-      while (bm) {
-        int      cl         = __builtin_ctzll(bm);
-        uint64_t cl_start   = static_cast<uint64_t>(cl) * BWB_CL_SIZE;
-        uint64_t cl_end     = cl_start + BWB_CL_SIZE;
-        /* Copy only the portion of this cacheline that the packet covers. */
-        if (cl_end > page_off && cl_start < page_off + pkt->getSize()) {
-          uint64_t copy_start = std::max(cl_start, page_off);
-          uint64_t copy_end   = std::min(cl_end, page_off + pkt->getSize());
-          std::memcpy(pkt_data  + (copy_start - page_off),
-                      bwb_page  +  copy_start,
-                      copy_end  -  copy_start);
-        }
-        bm &= bm - 1;  /* clear lowest set bit */
-      }
-
-      DPRINTF(CxlMemory,
-              "[BWB-MERGE-R] Overlaid BWB slot=%u lba=0x%lx page_off=0x%lx "
-              "pkt_size=%u dirty_bitmap=0x%016lx\n",
-              slot, lba, page_off, pkt->getSize(), meta->dirty_bitmap);
-    }
-  }
+  /* NOTE: No BWB overlay here.  mapped_cache_ is the authoritative store;
+   * access() already populated the packet from mapped_cache_ before this
+   * function was called.  Overlaying bwb_data_ on top would risk writing
+   * stale ring-buffer data over the correct packet payload.  The write-path
+   * merge in ssdWrite() still overlays bwb_data_ (which snoopClwb() now
+   * keeps in sync) to preserve byte-path writes before a block-path flush. */
 
   return storage_latency + latency_;
 }
@@ -1177,11 +1298,30 @@ void CxlMemory::snoopClwb(Addr paddr, size_t size) {
 
   BwbSlotMeta *meta = bwbLookup(lba);
   if (meta) {
-    /* Hit — accumulate cacheline bits; no ring slot allocation needed. */
+    /* Hit — accumulate bits AND sync the new dirty cachelines from
+     * mapped_cache_ into bwb_data_.  Without this sync, subsequent CLWBs
+     * to the same LBA update mapped_cache_ (via access()) but leave
+     * bwb_data_ stale for those cachelines.  The write-path overlay in
+     * ssdWrite() would then overwrite newer mapped_cache_ data with the
+     * older ring-buffer data, corrupting the write before NAND flush.   */
     meta->dirty_bitmap |= new_bits;
+    {
+      uint32_t       slot      = meta->log_index & (BWB_MAX_SLOTS - 1);
+      uint8_t       *bwb_page  = bwb_data_ + (uint64_t)slot * BWB_PAGE_SIZE;
+      const uint8_t *cache_pg  = reinterpret_cast<const uint8_t *>(mapped_cache_)
+                                 + lba * BWB_PAGE_SIZE;
+      uint64_t bits = new_bits;
+      while (bits) {
+        int cl = __builtin_ctzll(bits);
+        std::memcpy(bwb_page  + (uint64_t)cl * BWB_CL_SIZE,
+                    cache_pg  + (uint64_t)cl * BWB_CL_SIZE,
+                    BWB_CL_SIZE);
+        bits &= bits - 1;
+      }
+    }
     DPRINTF(CxlMemory,
       "[SDT] Snoop CLWB UPDATE lba=0x%lx cl_first=%lu cl_last=%lu "
-      "new_bits=0x%016lx accum=0x%016lx\n",
+      "new_bits=0x%016lx accum=0x%016lx (bwb_data_ synced)\n",
       lba, cl_first, cl_last, new_bits, meta->dirty_bitmap);
   } else {
     /* Miss — allocate a new SRAM entry (evicting LRU victim if needed).
