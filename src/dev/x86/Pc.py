@@ -70,6 +70,27 @@ class Pc(Platform):
     # A device to catch accesses to the non-existant floppy controller.
     fake_floppy = IsaFake(pio_addr=x86IOAddress(0x3F2), pio_size=2)
 
+    # Stubs for Intel PCH/SPI/HPET physical MMIO ranges not modeled by gem5.
+    # Linux probes these during boot; return 0 for reads, absorb writes.
+    # 0xFED00000: HPET base (1 page)
+    fake_hpet_mmio = IsaFake(
+        pio_addr=0xfed00000,
+        pio_size=0x1000,
+        ret_data8=0,
+        ret_data16=0,
+        ret_data32=0,
+        ret_data64=0,
+    )
+    # 0xFED80000: Intel SPI / PCH config registers (64 KiB)
+    fake_pch_mmio = IsaFake(
+        pio_addr=0xfed80000,
+        pio_size=0x10000,
+        ret_data8=0,
+        ret_data16=0,
+        ret_data32=0,
+        ret_data64=0,
+    )
+
     # A bus for accesses not claimed by a specific device.
     default_bus = IOXBar()
 
@@ -94,6 +115,8 @@ class Pc(Platform):
         self.fake_com_3.pio = bus.mem_side_ports
         self.fake_com_4.pio = bus.mem_side_ports
         self.fake_floppy.pio = bus.mem_side_ports
+        self.fake_hpet_mmio.pio = bus.mem_side_ports
+        self.fake_pch_mmio.pio = bus.mem_side_ports
         self.pci_host.pio = bus.mem_side_ports
 
         self.default_bus.cpu_side_ports = bus.default

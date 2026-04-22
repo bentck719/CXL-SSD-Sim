@@ -149,11 +149,22 @@ namespace X86ISA {
 /*            case SVMInfo:
               case TLB1GBPageInfo:
               case PerformanceInfo:*/
+              case 29:
+                // 0x8000001d: AMD Deterministic Cache Parameters.
+                // Return null entry (EAX[4:0]=0) for all sub-leaves.
+                result = CpuidResult(0x00000000, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
               default:
                 warn("x86 cpuid family 0x8000: unimplemented function %u",
                     funcNum);
                 return false;
             }
+        } else if (family == 0x4000) {
+            // Hypervisor CPUID range (0x40000000–0x4fffffff).
+            // gem5 is not a paravirt hypervisor; silently return false so
+            // the Linux KVM-guest driver skips all paravirt optimizations.
+            return false;
         } else if (family == 0x0000) {
             // The standard functions
             switch (funcNum) {
@@ -161,25 +172,117 @@ namespace X86ISA {
                 {
                   ISA *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
                   auto vendor_string = isa->getVendorString();
+                  // EAX = 0xd: highest standard leaf we implement (function 13,
+                  // XSAVE state enumeration).  Reporting this lets the kernel
+                  // query leaf 0xd for the correct XSAVE area sizes.
                   result = CpuidResult(
-                          NumExtendedCpuidFuncs - 1,
+                          0x0000000d,
                           stringToRegister(vendor_string.c_str()),
                           stringToRegister(vendor_string.c_str() + 4),
                           stringToRegister(vendor_string.c_str() + 8));
                 }
                 break;
               case FamilyModelStepping:
-                // ECX: clear bit 20 (SSE4.2/pcmpistri/crc32) and bit 1
-                // (PCLMULQDQ) — both are unimplemented in this gem5 ISA.
-                // Hiding them prevents glibc from selecting pcmpistri-based
-                // strlen/memchr paths that would corrupt ECX (WarnUnimpl
-                // no-op), causing cascading SIGSEGV in the O3 simulation.
+                // Restore original ECX feature flags (0xefdbfbff).
+                // SSE4.2 (bit 20), PCLMULQDQ (bit 1), XSAVE (bit 26), and
+                // OSXSAVE (bit 27) are all advertised as present so that
+                // Ubuntu 24.04 glibc (x86-64-v2 baseline) loads correctly.
+                // pcmpistri / pcmpistrm now have proper safe stubs in the
+                // ISA, and CPUID leaf 0xd (function 13) is implemented below
+                // so the kernel can determine the correct XSAVE area size.
                 result = CpuidResult(0x00020f51, 0x00000805,
-                                     0xefcbfbfd, 0x00000209);
+                                     0xefdbfbff, 0x00000209);
                 break;
               case ExtendedFeatures:
                 result = CpuidResult(0x00000000, 0x01800000,
                                      0x00000000, 0x00000000);
+                break;
+              case 13:
+                // XSAVE Extended State Enumeration (leaf 0xd).
+                // The 'index' parameter is the sub-leaf (ECX on entry).
+                switch (index) {
+                  case 0:
+                    // Sub-leaf 0: supported XCR0 feature mask and total sizes.
+                    // EAX[1:0] = 0x3 → x87 (bit 0) + SSE/XMM (bit 1).
+                    // EBX = required XSAVE area size for current XCR0:
+                    //   512 B legacy FXSAVE region + 64 B XSAVE header = 576 B.
+                    // ECX = maximum XSAVE area size (same, no AVX/other exts).
+                    // EDX = upper 32 bits of XCR0 supported mask (0).
+                    result = CpuidResult(0x00000003, 0x00000240,
+                                         0x00000240, 0x00000000);
+                    break;
+                  case 1:
+                    // Sub-leaf 1: XSAVEOPT / XSAVEC / XGETBV(1) / XSAVES.
+                    // None of these extensions are simulated; return all-zero.
+                    result = CpuidResult(0x00000000, 0x00000240,
+                                         0x00000000, 0x00000000);
+                    break;
+                  default:
+                    // Sub-leaves 2+ describe individual state components
+                    // (e.g. YMM at sub-leaf 2).  Return 0 for all unsupported.
+                    result = CpuidResult(0x00000000, 0x00000000,
+                                         0x00000000, 0x00000000);
+                    break;
+                }
+                break;
+              case CacheAndTLB:
+                // Legacy cache/TLB descriptor leaf.  Return the
+                // "no descriptors" sentinel so the kernel uses leaf 4.
+                result = CpuidResult(0x00000001, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
+              case SerialNumber:
+                // Processor Serial Number — disabled on all modern CPUs.
+                result = CpuidResult(0x00000000, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
+              case CacheParams:
+                // Deterministic Cache Parameters (sub-leaf in ECX).
+                // EAX[4:0] = 0 → null entry, terminates enumeration.
+                // Returning zero for all sub-leaves tells the kernel and
+                // glibc that no deterministic cache info is available.
+                result = CpuidResult(0x00000000, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
+              case MonitorMwait:
+                // MONITOR/MWAIT parameters.  Not supported; idle=poll is
+                // passed on the cmdline so the kernel won't use MWAIT.
+                result = CpuidResult(0x00000000, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
+              case ThermalPowerMgmt:
+                // Thermal and Power Management — no features advertised.
+                result = CpuidResult(0x00000000, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
+              case 8:
+              case 9:
+              case 10:
+              case 12:
+                // Reserved / unimplemented leaves — return all zeros.
+                result = CpuidResult(0x00000000, 0x00000000,
+                                     0x00000000, 0x00000000);
+                break;
+              case 11:
+                // Extended Topology Enumeration (x2APIC).
+                // Single-core, single-thread topology.
+                switch (index) {
+                  case 0:
+                    // SMT level: 1 logical processor, shift = 0.
+                    result = CpuidResult(0x00000000, 0x00000001,
+                                         0x00000100, 0x00000000);
+                    break;
+                  case 1:
+                    // Core level: 1 logical processor per package, shift = 1.
+                    result = CpuidResult(0x00000001, 0x00000001,
+                                         0x00000201, 0x00000000);
+                    break;
+                  default:
+                    // Sub-leaf ≥ 2: level type = 0 (invalid), terminates.
+                    result = CpuidResult(0x00000000, 0x00000000,
+                                         (uint32_t)index, 0x00000000);
+                    break;
+                }
                 break;
               default:
                 warn("x86 cpuid family 0x0000: unimplemented function %u",

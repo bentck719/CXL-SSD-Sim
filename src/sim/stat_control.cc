@@ -53,6 +53,7 @@
 #include "base/statistics.hh"
 #include "base/time.hh"
 #include "sim/global_event.hh"
+#include <pybind11/pybind11.h>
 
 namespace gem5
 {
@@ -88,6 +89,10 @@ class StatEvent : public GlobalEvent
     virtual void
     process()
     {
+        // statistics::dump/reset call Python callbacks; this event is
+        // fired from a simulator worker thread that does not own the GIL.
+        pybind11::gil_scoped_acquire acquire;
+
         if (dump)
             statistics::dump();
 

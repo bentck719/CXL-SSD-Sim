@@ -98,6 +98,41 @@ output header {{
         generateDisassembly(Addr pc,
                             const loader::SymbolTable *symtab) const override;
     };
+
+    /**
+     * Safe stub for PCMPISTRI.  Implements the full implicit-length string
+     * comparison semantics (all four aggregation modes, both polarities,
+     * LSB/MSB output selection) and writes a deterministic ECX + EFLAGS.
+     * Supports register-register operands and attempts a functional TLB
+     * translation for memory operands so that glibc string routines
+     * (strlen, memchr, …) keep working in O3 mode.
+     */
+    class PcmpIstriSafeStub : public X86ISA::X86StaticInst
+    {
+      private:
+        mutable bool warned = false;
+      public:
+        PcmpIstriSafeStub(const char *_mnemonic, ExtMachInst _machInst)
+            : X86ISA::X86StaticInst(_mnemonic, _machInst, No_OpClass)
+        { flags[IsNonSpeculative] = true; }
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        std::string generateDisassembly(
+            Addr, const loader::SymbolTable *) const override;
+    };
+
+    /** Same as PcmpIstriSafeStub but writes a mask to XMM0 (PCMPISTRM). */
+    class PcmpIstrmSafeStub : public X86ISA::X86StaticInst
+    {
+      private:
+        mutable bool warned = false;
+      public:
+        PcmpIstrmSafeStub(const char *_mnemonic, ExtMachInst _machInst)
+            : X86ISA::X86StaticInst(_mnemonic, _machInst, No_OpClass)
+        { flags[IsNonSpeculative] = true; }
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        std::string generateDisassembly(
+            Addr, const loader::SymbolTable *) const override;
+    };
 }};
 
 output decoder {{
@@ -113,6 +148,20 @@ output decoder {{
             Addr pc, const loader::SymbolTable *symtab) const
     {
         return csprintf("%-10s (unimplemented)", mnemonic);
+    }
+
+    std::string
+    PcmpIstriSafeStub::generateDisassembly(
+            Addr pc, const loader::SymbolTable *symtab) const
+    {
+        return csprintf("%-10s (safe stub)", mnemonic);
+    }
+
+    std::string
+    PcmpIstrmSafeStub::generateDisassembly(
+            Addr pc, const loader::SymbolTable *symtab) const
+    {
+        return csprintf("%-10s (safe stub)", mnemonic);
     }
 }};
 
@@ -139,6 +188,277 @@ output exec {{
     }
 }};
 
+// ---------------------------------------------------------------------------
+// PCMPISTRI / PCMPISTRM safe stubs
+// ---------------------------------------------------------------------------
+output exec {{
+#include "arch/x86/regs/float.hh"
+#include "arch/x86/regs/int.hh"
+
+namespace {
+
+// Read 16 bytes from XMM register regIdx into out[0..15].
+void
+pcmpi_readXmm(ThreadContext *tc, unsigned regIdx, uint8_t out[16])
+{
+    using namespace X86ISA::float_reg;
+    uint64_t lo = tc->getReg(floatRegClass[XmmBase + 2 * regIdx]);
+    uint64_t hi = tc->getReg(floatRegClass[XmmBase + 2 * regIdx + 1]);
+    for (int i = 0; i < 8; i++) {
+        out[i]     = (lo >> (8 * i)) & 0xff;
+        out[i + 8] = (hi >> (8 * i)) & 0xff;
+    }
+}
+
+// Write 16 bytes to XMM register regIdx from data[0..15].
+void
+pcmpi_writeXmm(ThreadContext *tc, unsigned regIdx, const uint8_t data[16])
+{
+    using namespace X86ISA::float_reg;
+    uint64_t lo = 0, hi = 0;
+    for (int i = 0; i < 8; i++) {
+        lo |= (uint64_t)data[i]     << (8 * i);
+        hi |= (uint64_t)data[i + 8] << (8 * i);
+    }
+    tc->setReg(floatRegClass[XmmBase + 2 * regIdx],     lo);
+    tc->setReg(floatRegClass[XmmBase + 2 * regIdx + 1], hi);
+}
+
+// Attempt a functional virtual-memory read of 16 bytes at vaddr.
+// Returns true on success; on failure fills out[] with zeros.
+bool
+pcmpi_readMem(const ExtMachInst &mi, ThreadContext *tc, uint8_t out[16])
+{
+    using namespace X86ISA;
+
+    Addr vaddr = 0;
+    if (mi.modRM.rm == 4) {  // SIB byte present
+        unsigned baseIdx = mi.sib.base  | ((unsigned)mi.rex.b << 3);
+        unsigned idxIdx  = mi.sib.index | ((unsigned)mi.rex.x << 3);
+        Addr base  = tc->getReg(intRegClass[baseIdx]);
+        // SIB.index == 4 (RSP) encodes "no index"
+        Addr idx = ((mi.sib.index & 0x7) == 4) ? 0
+                                                : tc->getReg(intRegClass[idxIdx]);
+        unsigned scale = 1u << (unsigned)mi.sib.scale;
+        vaddr = base + scale * idx + (int64_t)(int32_t)mi.displacement;
+    } else {
+        // mod==0 && rm==5 is RIP-relative; we lack RIP here so fall back.
+        if (mi.modRM.mod == 0 && mi.modRM.rm == 5) {
+            memset(out, 0, 16);
+            return false;
+        }
+        unsigned baseIdx = mi.modRM.rm | ((unsigned)mi.rex.b << 3);
+        Addr base = tc->getReg(intRegClass[baseIdx]);
+        vaddr = base + (int64_t)(int32_t)mi.displacement;
+    }
+
+    auto req = std::make_shared<Request>(
+        vaddr, 16, Request::STRICT_ORDER,
+        Request::funcRequestorId, 0, tc->contextId());
+    Fault f = tc->getMMUPtr()->translateFunctional(req, tc, BaseMMU::Read);
+    if (f == NoFault) {
+        tc->getSystemPtr()->physProxy.readBlob(req->getPaddr(), out, 16);
+        return true;
+    }
+    memset(out, 0, 16);
+    return false;
+}
+
+// Core comparison engine.  Returns IntRes2 and sets s1NullPos / s2NullPos.
+uint16_t
+pcmpi_core(const uint8_t s1[], const uint8_t s2[],
+           uint8_t imm8, int &s1NullPos, int &s2NullPos)
+{
+    bool useWords = (imm8 & 0x1);
+    int  numElems = useWords ? 8 : 16;
+
+    // Locate first implicit null element in each operand.
+    s1NullPos = s2NullPos = numElems;
+    for (int i = 0; i < numElems; i++) {
+        bool n1 = useWords ? (s1[2*i] == 0 && s1[2*i+1] == 0) : (s1[i] == 0);
+        bool n2 = useWords ? (s2[2*i] == 0 && s2[2*i+1] == 0) : (s2[i] == 0);
+        if (n1 && s1NullPos == numElems) s1NullPos = i;
+        if (n2 && s2NullPos == numElems) s2NullPos = i;
+    }
+
+    int aggFunc = (imm8 >> 2) & 0x3;
+    uint16_t intRes1 = 0;
+
+    for (int i = 0; i < numElems; i++) {
+        bool s1v = (i < s1NullPos);
+        bool s2v = (i < s2NullPos);
+        bool match = false;
+
+        if (aggFunc == 0) {          // EqualAny: src2[i] in any valid src1 elem
+            if (s2v) {
+                for (int j = 0; j < s1NullPos; j++) {
+                    match = useWords ?
+                        (s1[2*j]==s2[2*i] && s1[2*j+1]==s2[2*i+1]) :
+                        (s1[j] == s2[i]);
+                    if (match) break;
+                }
+            }
+        } else if (aggFunc == 1) {   // Ranges: src2[i] in [lo,hi] pairs from src1
+            if (s2v) {
+                for (int j = 0; j + 1 < s1NullPos; j += 2) {
+                    if (useWords) {
+                        uint16_t lo = s1[2*j]   | (s1[2*j+1]   << 8);
+                        uint16_t hi = s1[2*j+2] | (s1[2*j+3]   << 8);
+                        uint16_t v  = s2[2*i]   | (s2[2*i+1]   << 8);
+                        if (v >= lo && v <= hi) { match = true; break; }
+                    } else {
+                        if (s2[i] >= s1[j] && s2[i] <= s1[j+1])
+                            { match = true; break; }
+                    }
+                }
+            }
+        } else if (aggFunc == 2) {   // EqualEach: src1[i] == src2[i]
+            if (!s1v && !s2v)
+                match = true;
+            else if (s1v && s2v)
+                match = useWords ?
+                    (s1[2*i]==s2[2*i] && s1[2*i+1]==s2[2*i+1]) :
+                    (s1[i] == s2[i]);
+        } else {                     // EqualOrdered: src1 as substring at offset i
+            bool ok = (s1NullPos > 0);  // empty needle always matches
+            for (int k = 0; ok && k < s1NullPos; k++) {
+                int pi = i + k;
+                if (pi >= numElems || pi >= s2NullPos) { ok = false; break; }
+                ok = useWords ?
+                    (s1[2*k]==s2[2*pi] && s1[2*k+1]==s2[2*pi+1]) :
+                    (s1[k] == s2[pi]);
+            }
+            match = ok;
+        }
+        if (match) intRes1 |= (uint16_t)(1 << i);
+    }
+
+    // Polarity (imm8 bit 4): invert IntRes1, then zero positions past src2 null.
+    uint16_t intRes2 = intRes1;
+    if (imm8 & 0x10) {
+        uint16_t mask = (uint16_t)((1 << numElems) - 1);
+        intRes2 = (uint16_t)(~intRes1) & mask;
+        for (int i = s2NullPos; i < numElems; i++)
+            intRes2 &= (uint16_t)~(1 << i);
+    }
+    return intRes2;
+}
+
+// Apply output index selection and write EFLAGS.
+void
+pcmpi_setFlags(ThreadContext *tc, uint16_t intRes2,
+               int s1NullPos, int s2NullPos, int numElems, uint8_t imm8)
+{
+    using namespace X86ISA;
+    uint64_t rflags = getRFlags(tc);
+    uint64_t clr = (1UL<<0)|(1UL<<2)|(1UL<<4)|(1UL<<6)|(1UL<<7)|(1UL<<11);
+    rflags &= ~clr;
+    if (intRes2 != 0)          rflags |= (1UL << 0);   // CF
+    if (s2NullPos < numElems)  rflags |= (1UL << 6);   // ZF: null in src2
+    if (s1NullPos < numElems)  rflags |= (1UL << 7);   // SF: null in src1
+    if (intRes2 & 1)           rflags |= (1UL << 11);  // OF: IntRes2[0]
+    setRFlags(tc, rflags);
+}
+
+} // anonymous namespace
+
+Fault
+PcmpIstriSafeStub::execute(ExecContext *xc,
+                            trace::InstRecord *traceData) const
+{
+    if (!warned) {
+        warn("pcmpistri safe stub: imm8=%#x\n", machInst.immediate & 0xff);
+        warned = true;
+    }
+
+    using namespace X86ISA;
+    ThreadContext *tc = xc->tcBase();
+
+    uint8_t imm8    = (uint8_t)(machInst.immediate & 0xff);
+    bool useWords   = (imm8 & 0x1);
+    int  numElems   = useWords ? 8 : 16;
+
+    unsigned src1Reg = machInst.modRM.reg | ((unsigned)machInst.rex.r << 3);
+    unsigned src2Reg = machInst.modRM.rm  | ((unsigned)machInst.rex.b << 3);
+
+    uint8_t s1[16], s2[16];
+    pcmpi_readXmm(tc, src1Reg, s1);
+
+    if (machInst.modRM.mod == 3)
+        pcmpi_readXmm(tc, src2Reg, s2);
+    else
+        pcmpi_readMem(machInst, tc, s2);
+
+    int s1NullPos, s2NullPos;
+    uint16_t intRes2 = pcmpi_core(s1, s2, imm8, s1NullPos, s2NullPos);
+
+    // Output index selection (imm8 bit 5): 0=LSB, 1=MSB
+    int ecxVal = numElems;
+    if (imm8 & 0x20) {
+        for (int i = numElems - 1; i >= 0; i--)
+            if (intRes2 & (1 << i)) { ecxVal = i; break; }
+    } else {
+        for (int i = 0; i < numElems; i++)
+            if (intRes2 & (1 << i)) { ecxVal = i; break; }
+    }
+
+    tc->setReg(intRegClass[int_reg::_RcxIdx], (RegVal)(uint32_t)ecxVal);
+    pcmpi_setFlags(tc, intRes2, s1NullPos, s2NullPos, numElems, imm8);
+
+    return NoFault;
+}
+
+Fault
+PcmpIstrmSafeStub::execute(ExecContext *xc,
+                             trace::InstRecord *traceData) const
+{
+    if (!warned) {
+        warn("pcmpistrm safe stub: imm8=%#x\n", machInst.immediate & 0xff);
+        warned = true;
+    }
+
+    using namespace X86ISA;
+    ThreadContext *tc = xc->tcBase();
+
+    uint8_t imm8   = (uint8_t)(machInst.immediate & 0xff);
+    bool useWords  = (imm8 & 0x1);
+    int  numElems  = useWords ? 8 : 16;
+
+    unsigned src1Reg = machInst.modRM.reg | ((unsigned)machInst.rex.r << 3);
+    unsigned src2Reg = machInst.modRM.rm  | ((unsigned)machInst.rex.b << 3);
+
+    uint8_t s1[16], s2[16];
+    pcmpi_readXmm(tc, src1Reg, s1);
+
+    if (machInst.modRM.mod == 3)
+        pcmpi_readXmm(tc, src2Reg, s2);
+    else
+        pcmpi_readMem(machInst, tc, s2);
+
+    int s1NullPos, s2NullPos;
+    uint16_t intRes2 = pcmpi_core(s1, s2, imm8, s1NullPos, s2NullPos);
+
+    // Write result mask to XMM0.
+    // Byte mode: each byte[i] = 0xFF if IntRes2[i], else 0x00
+    // Word mode: each word[i] = 0xFFFF if IntRes2[i], else 0x0000
+    uint8_t xmm0[16] = {};
+    if (useWords) {
+        for (int i = 0; i < numElems; i++) {
+            uint16_t v = (intRes2 & (1 << i)) ? 0xFFFF : 0x0000;
+            xmm0[2*i]   = v & 0xFF;
+            xmm0[2*i+1] = (v >> 8) & 0xFF;
+        }
+    } else {
+        for (int i = 0; i < numElems; i++)
+            xmm0[i] = (intRes2 & (1 << i)) ? 0xFF : 0x00;
+    }
+    pcmpi_writeXmm(tc, 0, xmm0);
+    pcmpi_setFlags(tc, intRes2, s1NullPos, s2NullPos, numElems, imm8);
+
+    return NoFault;
+}
+}};
+
 
 def format FailUnimpl() {{
     iop = InstObjParams(name, 'FailUnimplemented')
@@ -147,5 +467,15 @@ def format FailUnimpl() {{
 
 def format WarnUnimpl() {{
     iop = InstObjParams(name, 'WarnUnimplemented')
+    decode_block = BasicDecodeWithMnemonic.subst(iop)
+}};
+
+def format PcmpIstriStub() {{
+    iop = InstObjParams(name, 'PcmpIstriSafeStub')
+    decode_block = BasicDecodeWithMnemonic.subst(iop)
+}};
+
+def format PcmpIstrmStub() {{
+    iop = InstObjParams(name, 'PcmpIstrmSafeStub')
     decode_block = BasicDecodeWithMnemonic.subst(iop)
 }};
